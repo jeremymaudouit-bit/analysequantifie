@@ -7,13 +7,25 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
 
-import cv2
-import mediapipe as mp
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 from PIL import Image
 from fpdf import FPDF
+
+CV2_IMPORT_ERROR = None
+MP_IMPORT_ERROR = None
+try:
+    import cv2
+except Exception as exc:
+    cv2 = None
+    CV2_IMPORT_ERROR = exc
+
+try:
+    import mediapipe as mp
+except Exception as exc:
+    mp = None
+    MP_IMPORT_ERROR = exc
 
 # ============================================================
 # CONFIG
@@ -23,13 +35,15 @@ st.title("🧍🏃 Biomeca Suite - Analyse unifiée")
 st.caption("Une seule application pour l'analyse cinématique, frontale et posturale avec un rapport global unique.")
 
 FPS_DEFAULT = 30
-POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS
+POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS if mp is not None else None
 
 # ============================================================
 # MEDIAPIPE
 # ============================================================
 @st.cache_resource
 def load_video_pose():
+    if mp is None:
+        return None
     return mp.solutions.pose.Pose(
         static_image_mode=False,
         model_complexity=1,
@@ -40,6 +54,8 @@ def load_video_pose():
 
 @st.cache_resource
 def load_image_pose():
+    if mp is None:
+        return None
     return mp.solutions.pose.Pose(
         static_image_mode=True,
         model_complexity=1,
@@ -50,6 +66,32 @@ def load_image_pose():
 
 POSE_VIDEO = load_video_pose()
 POSE_IMAGE = load_image_pose()
+
+def dependencies_ready() -> bool:
+    return cv2 is not None and mp is not None and POSE_VIDEO is not None and POSE_IMAGE is not None
+
+def show_dependency_help() -> None:
+    st.error("Les dépendances OpenCV / MediaPipe ne sont pas correctement chargées sur cet environnement.")
+    if CV2_IMPORT_ERROR is not None:
+        st.code(f"Erreur cv2: {CV2_IMPORT_ERROR}")
+    if MP_IMPORT_ERROR is not None:
+        st.code(f"Erreur mediapipe: {MP_IMPORT_ERROR}")
+    st.markdown(
+        """
+### Correctif recommandé
+Utilisez ces versions dans `requirements.txt` :
+```txt
+streamlit==1.44.1
+numpy<2
+opencv-python-headless==4.10.0.84
+mediapipe==0.10.21
+matplotlib==3.8.4
+Pillow==10.4.0
+fpdf2==2.8.3
+```
+Et pour l'hébergement, gardez `runtime.txt` sur Python 3.11.
+"""
+    )
 
 # ============================================================
 # PARAMÈTRES COMMUNS
@@ -81,6 +123,10 @@ patient = {
     "num_photos": int(num_photos),
     "max_frames": int(max_frames),
 }
+
+if not dependencies_ready():
+    show_dependency_help()
+    st.stop()
 
 # ============================================================
 # UPLOADS
