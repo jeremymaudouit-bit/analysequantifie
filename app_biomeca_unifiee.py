@@ -13,6 +13,12 @@ import streamlit as st
 from PIL import Image
 from fpdf import FPDF
 
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+except Exception:
+    streamlit_image_coordinates = None
+
+
 CV2_IMPORT_ERROR = None
 MP_IMPORT_ERROR = None
 try:
@@ -96,19 +102,70 @@ Et pour l'hébergement, gardez `runtime.txt` sur Python 3.11.
 # ============================================================
 # PARAMÈTRES COMMUNS
 # ============================================================
+if "override_front_points" not in st.session_state:
+    st.session_state["override_front_points"] = {}
+if "override_side_points" not in st.session_state:
+    st.session_state["override_side_points"] = {}
+
 with st.sidebar:
     st.header("Paramètres communs")
     nom = st.text_input("Nom", "")
     prenom = st.text_input("Prénom", "")
     taille_cm = st.number_input("Taille du patient (cm)", min_value=80, max_value=230, value=170, step=1)
+
+    st.divider()
+    st.subheader("Analyses dynamiques")
     conf = st.slider("Seuil de visibilité minimal", 0.1, 0.95, 0.5, 0.05)
-    smooth = st.slider("Lissage", 1, 15, 5, 2)
+    smooth = st.slider("Lissage", 0, 10, 3, 1)
     show_norm = st.checkbox("Afficher les courbes indicatives de référence", value=True)
     camera_pos = st.selectbox("Côté / angle vidéo de profil", ["Profil droit", "Profil gauche"])
     phase_cote = st.selectbox("Phases / côté dominant", ["Aucune", "Droite", "Gauche", "Les deux"])
     sample_stride = st.slider("Pas d'échantillonnage vidéo (1 = toutes les images)", 1, 6, 2)
     num_photos = st.slider("Nombre d'images annotées à exporter", 1, 8, 3)
     max_frames = st.slider("Nombre maximal d'images analysées par vidéo", 60, 600, 180, 30)
+
+    st.divider()
+    st.subheader("Correction statique par clic")
+    click_edit_enabled = st.checkbox(
+        "Activer la correction des points statiques",
+        value=True,
+        help="Permet de déplacer manuellement certains points avant le calcul, comme dans les applications statiques d'origine.",
+    )
+    display_width = st.slider("Largeur d'affichage image (px)", 320, 900, 520, 10)
+    auto_crop_static = st.checkbox("Cadrage automatique des images statiques", value=True)
+
+    editable_front_points = [
+        "Hanche G", "Hanche D", "Genou G", "Genou D",
+        "Cheville G", "Cheville D", "Talon G", "Talon D"
+    ]
+    editable_side_points = ["Epaule", "Hanche", "Genou", "Cheville", "Talon", "Oreille", "Nez"]
+
+    point_to_edit_front = st.selectbox(
+        "Point frontal à corriger",
+        editable_front_points,
+        disabled=not click_edit_enabled,
+    )
+    point_to_edit_side = st.selectbox(
+        "Point latéral à corriger",
+        editable_side_points,
+        disabled=not click_edit_enabled,
+    )
+
+    c_reset1, c_reset2 = st.columns(2)
+    with c_reset1:
+        if st.button("Reset point frontal", disabled=not click_edit_enabled):
+            st.session_state["override_front_points"].pop(point_to_edit_front, None)
+    with c_reset2:
+        if st.button("Reset point latéral", disabled=not click_edit_enabled):
+            st.session_state["override_side_points"].pop(point_to_edit_side, None)
+
+    c_reset3, c_reset4 = st.columns(2)
+    with c_reset3:
+        if st.button("Reset frontal", disabled=not click_edit_enabled):
+            st.session_state["override_front_points"] = {}
+    with c_reset4:
+        if st.button("Reset latéral", disabled=not click_edit_enabled):
+            st.session_state["override_side_points"] = {}
 
 patient = {
     "nom": nom.strip(),
@@ -122,6 +179,11 @@ patient = {
     "sample_stride": int(sample_stride),
     "num_photos": int(num_photos),
     "max_frames": int(max_frames),
+    "click_edit_enabled": bool(click_edit_enabled),
+    "display_width": int(display_width),
+    "auto_crop_static": bool(auto_crop_static),
+    "point_to_edit_front": point_to_edit_front,
+    "point_to_edit_side": point_to_edit_side,
 }
 
 if not dependencies_ready():
@@ -386,49 +448,100 @@ def run_cinematic(video_path: Optional[str], patient: Dict[str, Any]) -> Dict[st
             "metrics": {},
         }
 
-    idxs = side_indices(patient["camera_pos"])
-    hip_angles, knee_angles, ankle_angles, trunk_tilts, heel_y = [], [], [], [], []
+    mp_pl = mp.solutions.pose.PoseLandmark
+    res = {k: [] for k in ["Tronc", "Hanche G", "Hanche D", "Genou G", "Genou D", "Cheville G", "Cheville D"]}
+    heelG_y, heelD_y, heelG_x, heelD_x, toeG_x, toeD_x = [], [], [], [], [], []
     annotations = []
 
     for frame in frames:
         result = analyze_pose_frame(frame, static=False)
         if not result.pose_landmarks:
-            hip_angles.append(np.nan)
-            knee_angles.append(np.nan)
-            ankle_angles.append(np.nan)
-            trunk_tilts.append(np.nan)
-            heel_y.append(np.nan)
+            for k in res:
+                res[k].append(np.nan)
+            heelG_y.append(np.nan); heelD_y.append(np.nan)
+            heelG_x.append(np.nan); heelD_x.append(np.nan)
+            toeG_x.append(np.nan); toeD_x.append(np.nan)
             continue
 
         lms = result.pose_landmarks.landmark
-        h, w = frame.shape[:2]
+        def pt(enum_):
+            p = lms[enum_.value]
+            return np.array([p.x, p.y], dtype=np.float32), float(p.visibility)
+        kp = {}
+        for side, suf in [("LEFT", "G"), ("RIGHT", "D")]:
+            kp[f"Epaule {suf}"], kp[f"Epaule {suf} vis"] = pt(getattr(mp_pl, f"{side}_SHOULDER"))
+            kp[f"Hanche {suf}"], kp[f"Hanche {suf} vis"] = pt(getattr(mp_pl, f"{side}_HIP"))
+            kp[f"Genou {suf}"], kp[f"Genou {suf} vis"] = pt(getattr(mp_pl, f"{side}_KNEE"))
+            kp[f"Cheville {suf}"], kp[f"Cheville {suf} vis"] = pt(getattr(mp_pl, f"{side}_ANKLE"))
+            kp[f"Talon {suf}"], kp[f"Talon {suf} vis"] = pt(getattr(mp_pl, f"{side}_HEEL"))
+            kp[f"Orteil {suf}"], kp[f"Orteil {suf} vis"] = pt(getattr(mp_pl, f"{side}_FOOT_INDEX"))
 
-        pts = {}
-        all_ok = True
-        for key, ind in idxs.items():
-            lm = lms[ind]
-            if vis(lm) < patient["conf"]:
-                all_ok = False
-            pts[key] = xy(lm, w, h)
+        def ok(name):
+            return kp.get(f"{name} vis", 0.0) >= patient["conf"]
 
-        if all_ok:
-            hip_angles.append(angle_3pts(pts["shoulder"], pts["hip"], pts["knee"]))
-            knee_angles.append(angle_3pts(pts["hip"], pts["knee"], pts["ankle"]))
-            ankle_angles.append(angle_3pts(pts["knee"], pts["ankle"], pts["foot"]))
-            trunk_tilts.append(tilt_from_vertical(pts["hip"], pts["shoulder"]))
-            heel_y.append(pts["heel"][1])
-        else:
-            hip_angles.append(np.nan)
-            knee_angles.append(np.nan)
-            ankle_angles.append(np.nan)
-            trunk_tilts.append(np.nan)
-            heel_y.append(np.nan)
+        res["Tronc"].append(
+            angle_tronc_frontal(kp["Epaule G"][::-1], kp["Epaule D"][::-1], kp["Hanche G"][::-1], kp["Hanche D"][::-1]) * 0
+            if False else (
+                float(np.degrees(np.arctan2(
+                    ((kp["Epaule G"][0] + kp["Epaule D"][0]) / 2.0) - ((kp["Hanche G"][0] + kp["Hanche D"][0]) / 2.0),
+                    -(((kp["Epaule G"][1] + kp["Epaule D"][1]) / 2.0) - ((kp["Hanche G"][1] + kp["Hanche D"][1]) / 2.0)) + 1e-6
+                )))
+                if (ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D")) else np.nan
+            )
+        )
+        res["Hanche G"].append(angle_hanche(kp["Epaule G"][0:2], kp["Hanche G"][0:2], kp["Genou G"][0:2]) if (ok("Epaule G") and ok("Hanche G") and ok("Genou G")) else np.nan)
+        res["Hanche D"].append(angle_hanche(kp["Epaule D"][0:2], kp["Hanche D"][0:2], kp["Genou D"][0:2]) if (ok("Epaule D") and ok("Hanche D") and ok("Genou D")) else np.nan)
+        res["Genou G"].append(angle_genou(kp["Hanche G"][0:2], kp["Genou G"][0:2], kp["Cheville G"][0:2]) if (ok("Hanche G") and ok("Genou G") and ok("Cheville G")) else np.nan)
+        res["Genou D"].append(angle_genou(kp["Hanche D"][0:2], kp["Genou D"][0:2], kp["Cheville D"][0:2]) if (ok("Hanche D") and ok("Genou D") and ok("Cheville D")) else np.nan)
+        res["Cheville G"].append(angle_cheville(kp["Genou G"][0:2], kp["Cheville G"][0:2], kp["Talon G"][0:2], kp["Orteil G"][0:2]) if (ok("Genou G") and ok("Cheville G") and ok("Talon G") and ok("Orteil G")) else np.nan)
+        res["Cheville D"].append(angle_cheville(kp["Genou D"][0:2], kp["Cheville D"][0:2], kp["Talon D"][0:2], kp["Orteil D"][0:2]) if (ok("Genou D") and ok("Cheville D") and ok("Talon D") and ok("Orteil D")) else np.nan)
 
-    hip_s = smooth_ma(interp_nan(np.array(hip_angles)), patient["smooth"])
-    knee_s = smooth_ma(interp_nan(np.array(knee_angles)), patient["smooth"])
-    ankle_s = smooth_ma(interp_nan(np.array(ankle_angles)), patient["smooth"])
-    trunk_s = smooth_ma(interp_nan(np.array(trunk_tilts)), patient["smooth"])
-    heel_s = smooth_ma(interp_nan(np.array(heel_y)), patient["smooth"])
+        heelG_y.append(float(kp["Talon G"][1]) if ok("Talon G") else np.nan)
+        heelD_y.append(float(kp["Talon D"][1]) if ok("Talon D") else np.nan)
+        heelG_x.append(float(kp["Talon G"][0]) if ok("Talon G") else np.nan)
+        heelD_x.append(float(kp["Talon D"][0]) if ok("Talon D") else np.nan)
+        toeG_x.append(float(kp["Orteil G"][0]) if ok("Orteil G") else np.nan)
+        toeD_x.append(float(kp["Orteil D"][0]) if ok("Orteil D") else np.nan)
+
+    contactsG, heelG_s = detect_foot_contacts(heelG_y, fps=fps)
+    contactsD, heelD_s = detect_foot_contacts(heelD_y, fps=fps)
+    _, step_time_G_mean, step_time_G_std = compute_step_times(contactsG, fps=fps)
+    _, step_time_D_mean, step_time_D_std = compute_step_times(contactsD, fps=fps)
+
+    phases = []
+    if patient["phase_cote"] in ["Gauche", "Les deux"]:
+        c = detect_cycle(heelG_y)
+        if c: phases.append((*c, "orange"))
+    if patient["phase_cote"] in ["Droite", "Les deux"]:
+        c = detect_cycle(heelD_y)
+        if c: phases.append((*c, "blue"))
+
+    figures = []
+    table_metrics = []
+    asym_rows = []
+    # Tronc
+    trunk_raw = np.array(res["Tronc"], dtype=float)
+    trunk = smooth_clinical(trunk_raw, smooth_level=patient["smooth"])
+    figures.append(build_plot({"Tronc": trunk}, "Cinematique_Tronc", "Angle (deg)", patient["show_norm"]))
+    if np.sum(~np.isnan(trunk_raw)):
+        vals = trunk[~np.isnan(trunk_raw)]
+        table_metrics.append(("Tronc", float(np.min(vals)), float(np.mean(vals)), float(np.max(vals))))
+    # articulations
+    for joint in ["Hanche", "Genou", "Cheville"]:
+        g_raw = np.array(res[f"{joint} G"], dtype=float)
+        d_raw = np.array(res[f"{joint} D"], dtype=float)
+        g = smooth_clinical(g_raw, smooth_level=patient["smooth"])
+        d = smooth_clinical(d_raw, smooth_level=patient["smooth"])
+        figures.append(build_plot({f"{joint} G": g, f"{joint} D": d}, f"Cinematique_{joint}", "Angle (deg)", patient["show_norm"]))
+        for side, arrf, arrr in [("Gauche", g, g_raw), ("Droite", d, d_raw)]:
+            mask = ~np.isnan(arrr)
+            if mask.sum():
+                vals = arrf[mask]
+                table_metrics.append((f"{joint} {side}", float(np.min(vals)), float(np.mean(vals)), float(np.max(vals))))
+        gmean = float(np.mean(g[~np.isnan(g_raw)])) if np.sum(~np.isnan(g_raw)) else None
+        dmean = float(np.mean(d[~np.isnan(d_raw)])) if np.sum(~np.isnan(d_raw)) else None
+        asym = None if (gmean is None or dmean is None or abs((gmean+dmean)/2.0) < 1e-6) else 100.0 * abs(dmean-gmean) / abs((gmean+dmean)/2.0)
+        asym_rows.append((joint, gmean, dmean, asym))
 
     for idx in np.linspace(0, len(frames) - 1, min(patient["num_photos"], len(frames)), dtype=int):
         r = analyze_pose_frame(frames[idx], static=False)
@@ -437,49 +550,36 @@ def run_cinematic(video_path: Optional[str], patient: Dict[str, Any]) -> Dict[st
         cv2.imwrite(out, img)
         annotations.append(out)
 
-    contacts = []
-    if len(heel_s) >= 3:
-        for i in range(1, len(heel_s) - 1):
-            if heel_s[i] > heel_s[i - 1] and heel_s[i] >= heel_s[i + 1]:
-                contacts.append(i)
-
-    step_times = np.diff(np.array(contacts) / max(fps, 1))
-    plot1 = build_plot(
-        {"Hanche": hip_s, "Genou": knee_s, "Cheville": ankle_s, "Tronc": trunk_s},
-        "Cinematique_angles",
-        "Angle (deg)",
-        patient["show_norm"],
-    )
-    plot2 = build_plot({"Talon": heel_s}, "Cinematique_contact_talon", "Position Y (px)", False)
-
-    bullets = [
-        f"Images analysées : {len(frames)}",
-        f"FPS estimé : {fps:.1f}",
-        f"Amplitude hanche : {np.nanmax(hip_s) - np.nanmin(hip_s):.1f} deg",
-        f"Amplitude genou : {np.nanmax(knee_s) - np.nanmin(knee_s):.1f} deg",
-        f"Amplitude cheville : {np.nanmax(ankle_s) - np.nanmin(ankle_s):.1f} deg",
-        f"Inclinaison moyenne du tronc : {np.nanmean(trunk_s):.1f} deg",
-    ]
-    if len(step_times):
-        bullets.append(f"Temps moyen entre contacts détectés : {np.mean(step_times):.2f} s")
+    bullets = []
+    if table_metrics:
+        for label, vmin, vmean, vmax in table_metrics[:7]:
+            bullets.append(f"{label} - min {vmin:.1f} deg | moyenne {vmean:.1f} deg | max {vmax:.1f} deg")
+    for joint, gmean, dmean, asym in asym_rows:
+        if gmean is not None and dmean is not None:
+            if asym is None:
+                bullets.append(f"{joint} - moy G {gmean:.1f} deg | moy D {dmean:.1f} deg")
+            else:
+                bullets.append(f"{joint} - moy G {gmean:.1f} deg | moy D {dmean:.1f} deg | asym {asym:.1f} %")
+    if step_time_G_mean is not None:
+        bullets.append(f"Temps du pas gauche : {step_time_G_mean:.2f} s (+/- {step_time_G_std:.2f} s)")
     else:
-        bullets.append("Temps de pas non estimable sur cette vidéo.")
+        bullets.append("Temps du pas gauche non calculable")
+    if step_time_D_mean is not None:
+        bullets.append(f"Temps du pas droit : {step_time_D_mean:.2f} s (+/- {step_time_D_std:.2f} s)")
+    else:
+        bullets.append("Temps du pas droit non calculable")
+    bullets.append(f"Contacts detectes : gauche {len(contactsG)} | droit {len(contactsD)}")
 
     return {
         "title": "Analyse cinématique",
         "status": "ok",
-        "summary": "Analyse du profil réalisée à partir des angles de hanche, genou, cheville et de l'inclinaison du tronc.",
+        "summary": "Analyse cinématique calculée avec les mêmes angles principaux que dans l'application d'origine : tronc, hanche, genou et cheville.",
         "bullet_points": bullets,
-        "plots": [plot1, plot2],
+        "plots": figures,
         "annotated_images": annotations,
-        "metrics": {
-            "hip_mean": float(np.nanmean(hip_s)),
-            "knee_mean": float(np.nanmean(knee_s)),
-            "ankle_mean": float(np.nanmean(ankle_s)),
-            "trunk_mean": float(np.nanmean(trunk_s)),
-            "contacts": len(contacts),
-        },
+        "metrics": {"contactsG": len(contactsG), "contactsD": len(contactsD)},
     }
+
 
 # ============================================================
 # ANALYSE FRONTALE / VUE ARRIÈRE
@@ -501,67 +601,82 @@ def run_frontal(video_path: Optional[str], patient: Dict[str, Any]) -> Dict[str,
         }
 
     mp_pl = mp.solutions.pose.PoseLandmark
-    pelvis_tilt, shoulder_tilt, trunk_shift, knee_gap, heelL_y, heelR_y = [], [], [], [], [], []
+    data = {"Genou G": [], "Genou D": [], "Arriere-pied G": [], "Arriere-pied D": [], "Bassin": [], "Tronc": []}
+    heelG_y, heelD_y = [], []
     annotations = []
 
     for frame in frames:
         result = analyze_pose_frame(frame, static=False)
         if not result.pose_landmarks:
-            pelvis_tilt.append(np.nan)
-            shoulder_tilt.append(np.nan)
-            trunk_shift.append(np.nan)
-            knee_gap.append(np.nan)
-            heelL_y.append(np.nan)
-            heelR_y.append(np.nan)
+            for k in data: data[k].append(np.nan)
+            heelG_y.append(np.nan); heelD_y.append(np.nan)
             continue
-
         lms = result.pose_landmarks.landmark
-        h, w = frame.shape[:2]
-        needed = [
-            mp_pl.LEFT_SHOULDER.value, mp_pl.RIGHT_SHOULDER.value,
-            mp_pl.LEFT_HIP.value, mp_pl.RIGHT_HIP.value,
-            mp_pl.LEFT_KNEE.value, mp_pl.RIGHT_KNEE.value,
-            mp_pl.LEFT_HEEL.value, mp_pl.RIGHT_HEEL.value,
-            mp_pl.NOSE.value,
-        ]
-        if any(vis(lms[i]) < patient["conf"] for i in needed):
-            pelvis_tilt.append(np.nan)
-            shoulder_tilt.append(np.nan)
-            trunk_shift.append(np.nan)
-            knee_gap.append(np.nan)
-            heelL_y.append(np.nan)
-            heelR_y.append(np.nan)
-            continue
+        def pt(enum_):
+            p = lms[enum_.value]
+            return np.array([p.x, p.y], dtype=np.float32), float(p.visibility)
+        kp = {}
+        for side, suf in [("LEFT", "G"), ("RIGHT", "D")]:
+            kp[f"Epaule {suf}"], kp[f"Epaule {suf} vis"] = pt(getattr(mp_pl, f"{side}_SHOULDER"))
+            kp[f"Hanche {suf}"], kp[f"Hanche {suf} vis"] = pt(getattr(mp_pl, f"{side}_HIP"))
+            kp[f"Genou {suf}"], kp[f"Genou {suf} vis"] = pt(getattr(mp_pl, f"{side}_KNEE"))
+            kp[f"Cheville {suf}"], kp[f"Cheville {suf} vis"] = pt(getattr(mp_pl, f"{side}_ANKLE"))
+            kp[f"Talon {suf}"], kp[f"Talon {suf} vis"] = pt(getattr(mp_pl, f"{side}_HEEL"))
+        def ok(name):
+            return kp.get(f"{name} vis", 0.0) >= patient["conf"]
 
-        Ls, Rs = xy(lms[mp_pl.LEFT_SHOULDER.value], w, h), xy(lms[mp_pl.RIGHT_SHOULDER.value], w, h)
-        Lh, Rh = xy(lms[mp_pl.LEFT_HIP.value], w, h), xy(lms[mp_pl.RIGHT_HIP.value], w, h)
-        Lk, Rk = xy(lms[mp_pl.LEFT_KNEE.value], w, h), xy(lms[mp_pl.RIGHT_KNEE.value], w, h)
-        nose = xy(lms[mp_pl.NOSE.value], w, h)
-        Lheel, Rheel = xy(lms[mp_pl.LEFT_HEEL.value], w, h), xy(lms[mp_pl.RIGHT_HEEL.value], w, h)
+        data["Genou G"].append(angle_genou_frontal(kp["Hanche G"][0:2], kp["Genou G"][0:2], kp["Cheville G"][0:2], side="G") if (ok("Hanche G") and ok("Genou G") and ok("Cheville G")) else np.nan)
+        data["Genou D"].append(angle_genou_frontal(kp["Hanche D"][0:2], kp["Genou D"][0:2], kp["Cheville D"][0:2], side="D") if (ok("Hanche D") and ok("Genou D") and ok("Cheville D")) else np.nan)
+        data["Arriere-pied G"].append(angle_arriere_pied_frontal(kp["Cheville G"][0:2], kp["Talon G"][0:2], side="G") if (ok("Cheville G") and ok("Talon G")) else np.nan)
+        data["Arriere-pied D"].append(angle_arriere_pied_frontal(kp["Cheville D"][0:2], kp["Talon D"][0:2], side="D") if (ok("Cheville D") and ok("Talon D")) else np.nan)
+        data["Bassin"].append(angle_bassin_frontal(kp["Hanche G"][0:2], kp["Hanche D"][0:2]) if (ok("Hanche G") and ok("Hanche D")) else np.nan)
+        data["Tronc"].append(angle_tronc_frontal(kp["Epaule G"][0:2], kp["Epaule D"][0:2], kp["Hanche G"][0:2], kp["Hanche D"][0:2]) if (ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D")) else np.nan)
+        heelG_y.append(float(kp["Talon G"][1]) if ok("Talon G") else np.nan)
+        heelD_y.append(float(kp["Talon D"][1]) if ok("Talon D") else np.nan)
 
-        pelvis_tilt.append(tilt_from_horizontal(Lh, Rh))
-        shoulder_tilt.append(tilt_from_horizontal(Ls, Rs))
-        mid_shoulders = avg_point([Ls, Rs])
-        mid_pelvis = avg_point([Lh, Rh])
-        trunk_shift.append(mid_shoulders[0] - mid_pelvis[0])
-        knee_gap.append(abs(Lk[0] - Rk[0]))
-        heelL_y.append(Lheel[1])
-        heelR_y.append(Rheel[1])
+    contactsG, heelG_s = detect_foot_contacts(heelG_y, fps=fps)
+    contactsD, heelD_s = detect_foot_contacts(heelD_y, fps=fps)
+    _, step_time_G_mean, step_time_G_std = compute_step_times(contactsG, fps=fps)
+    _, step_time_D_mean, step_time_D_std = compute_step_times(contactsD, fps=fps)
 
-    pelvis_s = smooth_ma(interp_nan(np.array(pelvis_tilt)), patient["smooth"])
-    shoulder_s = smooth_ma(interp_nan(np.array(shoulder_tilt)), patient["smooth"])
-    trunk_s = smooth_ma(interp_nan(np.array(trunk_shift)), patient["smooth"])
-    knee_gap_s = smooth_ma(interp_nan(np.array(knee_gap)), patient["smooth"])
-    heelL_s = smooth_ma(interp_nan(np.array(heelL_y)), patient["smooth"])
-    heelR_s = smooth_ma(interp_nan(np.array(heelR_y)), patient["smooth"])
+    phases = []
+    if patient["phase_cote"] in ["Gauche", "Les deux"]:
+        c = detect_cycle(heelG_y)
+        if c: phases.append((*c, "orange"))
+    if patient["phase_cote"] in ["Droite", "Les deux"]:
+        c = detect_cycle(heelD_y)
+        if c: phases.append((*c, "blue"))
 
-    contactsL, contactsR = [], []
-    if len(heelL_s) >= 3:
-        for i in range(1, len(heelL_s) - 1):
-            if heelL_s[i] > heelL_s[i - 1] and heelL_s[i] >= heelL_s[i + 1]:
-                contactsL.append(i)
-            if heelR_s[i] > heelR_s[i - 1] and heelR_s[i] >= heelR_s[i + 1]:
-                contactsR.append(i)
+    figures = []
+    table_metrics = []
+    asym_rows = []
+    for label, lk, rk in [("Genou", "Genou G", "Genou D"), ("Arriere-pied", "Arriere-pied G", "Arriere-pied D")]:
+        g_raw = np.array(data[lk], dtype=float)
+        d_raw = np.array(data[rk], dtype=float)
+        local_smooth = patient["smooth"] + 2 if label == "Arriere-pied" else patient["smooth"]
+        g = smooth_clinical(g_raw, smooth_level=local_smooth)
+        d = smooth_clinical(d_raw, smooth_level=local_smooth)
+        figures.append(build_plot({lk: g, rk: d}, f"Frontale_{label}", "Angle (deg)", patient["show_norm"]))
+        for side, arrf, arrr in [("Gauche", g, g_raw), ("Droite", d, d_raw)]:
+            mask = ~np.isnan(arrr)
+            if mask.sum():
+                vals = arrf[mask]
+                table_metrics.append((f"{label} {side}", float(np.min(vals)), float(np.mean(vals)), float(np.max(vals))))
+        gmean = float(np.mean(g[~np.isnan(g_raw)])) if np.sum(~np.isnan(g_raw)) else None
+        dmean = float(np.mean(d[~np.isnan(d_raw)])) if np.sum(~np.isnan(d_raw)) else None
+        asym = None if (gmean is None or dmean is None or abs((gmean+dmean)/2.0) < 1e-6) else 100.0 * abs(dmean-gmean) / abs((gmean+dmean)/2.0)
+        asym_rows.append((label, gmean, dmean, asym))
+
+    for label in ["Bassin", "Tronc"]:
+        raw = np.array(data[label], dtype=float)
+        val = smooth_clinical(raw, smooth_level=patient["smooth"])
+        figures.append(build_plot({label: val}, f"Frontale_{label}", "Angle (deg)", patient["show_norm"]))
+        mask = ~np.isnan(raw)
+        if mask.sum():
+            vals = val[mask]
+            table_metrics.append((label, float(np.min(vals)), float(np.mean(vals)), float(np.max(vals))))
+
+    figures.append(build_plot({"Talon G": heelG_s, "Talon D": heelD_s}, "Frontale_contacts", "Position Y (px)", False))
 
     for idx in np.linspace(0, len(frames) - 1, min(patient["num_photos"], len(frames)), dtype=int):
         r = analyze_pose_frame(frames[idx], static=False)
@@ -570,43 +685,35 @@ def run_frontal(video_path: Optional[str], patient: Dict[str, Any]) -> Dict[str,
         cv2.imwrite(out, img)
         annotations.append(out)
 
-    plot1 = build_plot(
-        {"Bassin": pelvis_s, "Epaules": shoulder_s, "Tronc X": trunk_s},
-        "Frontale_alignements",
-        "Mesure (px / deg)",
-        False,
-    )
-    plot2 = build_plot(
-        {"Talon G": heelL_s, "Talon D": heelR_s},
-        "Frontale_contacts",
-        "Position Y (px)",
-        False,
-    )
-
-    bullets = [
-        f"Images analysées : {len(frames)}",
-        f"Obliquité moyenne du bassin : {np.nanmean(pelvis_s):.1f} deg",
-        f"Obliquité moyenne des épaules : {np.nanmean(shoulder_s):.1f} deg",
-        f"Décalage latéral moyen du tronc : {np.nanmean(trunk_s):.1f} px",
-        f"Distance moyenne entre genoux : {np.nanmean(knee_gap_s):.1f} px",
-        f"Contacts gauche détectés : {len(contactsL)} | contacts droit détectés : {len(contactsR)}",
-    ]
+    bullets = []
+    for label, vmin, vmean, vmax in table_metrics[:8]:
+        bullets.append(f"{label} - min {vmin:.1f} deg | moyenne {vmean:.1f} deg | max {vmax:.1f} deg")
+    for joint, gmean, dmean, asym in asym_rows:
+        if gmean is not None and dmean is not None:
+            if asym is None:
+                bullets.append(f"{joint} - moy G {gmean:.1f} deg | moy D {dmean:.1f} deg")
+            else:
+                bullets.append(f"{joint} - moy G {gmean:.1f} deg | moy D {dmean:.1f} deg | asym {asym:.1f} %")
+    if step_time_G_mean is not None:
+        bullets.append(f"Temps du pas gauche : {step_time_G_mean:.2f} s (+/- {step_time_G_std:.2f} s)")
+    else:
+        bullets.append("Temps du pas gauche non calculable")
+    if step_time_D_mean is not None:
+        bullets.append(f"Temps du pas droit : {step_time_D_mean:.2f} s (+/- {step_time_D_std:.2f} s)")
+    else:
+        bullets.append("Temps du pas droit non calculable")
+    bullets.append(f"Contacts detectes : gauche {len(contactsG)} | droit {len(contactsD)}")
 
     return {
         "title": "Analyse frontale / vue arrière",
         "status": "ok",
-        "summary": "Analyse de l'alignement frontal avec bassin, épaules, translation du tronc et détection simplifiée des contacts talon.",
+        "summary": "Analyse frontale recalée sur les mesures de l'application d'origine : genoux, arrière-pied, bassin et tronc.",
         "bullet_points": bullets,
-        "plots": [plot1, plot2],
+        "plots": figures,
         "annotated_images": annotations,
-        "metrics": {
-            "pelvis_mean": float(np.nanmean(pelvis_s)),
-            "shoulder_mean": float(np.nanmean(shoulder_s)),
-            "trunk_shift_mean": float(np.nanmean(trunk_s)),
-            "contacts_left": len(contactsL),
-            "contacts_right": len(contactsR),
-        },
+        "metrics": {"contactsG": len(contactsG), "contactsD": len(contactsD)},
     }
+
 
 # ============================================================
 # ANALYSE POSTURALE FRONTALE
@@ -628,81 +735,86 @@ def run_postural_front(image_path: Optional[str], patient: Dict[str, Any]) -> Di
         }
 
     img_rgb = rotate_if_landscape(ensure_rgb(img_bgr))
-    result = POSE_IMAGE.process(img_rgb)
-    if not result.pose_landmarks:
+    res_for_crop = POSE_IMAGE.process(img_rgb)
+    if patient.get("auto_crop_static"):
+        img_rgb = crop_to_landmarks(img_rgb, res_for_crop, pad_ratio=0.18)
+
+    origin_points = extract_origin_points_from_mediapipe_front(img_rgb)
+    if origin_points is None:
         return {
             "title": "Analyse posturale frontale",
             "status": "erreur",
-            "summary": "Aucun squelette détecté.",
-            "bullet_points": ["MediaPipe n'a pas détecté correctement la posture."],
+            "summary": "Aucune pose détectée.",
+            "bullet_points": ["Utilisez une photo nette, en pied, bien centrée."],
             "plots": [],
             "annotated_images": [],
             "metrics": {},
         }
 
-    h, w = img_rgb.shape[:2]
-    lms = result.pose_landmarks.landmark
-    mp_pl = mp.solutions.pose.PoseLandmark
+    if patient.get("click_edit_enabled") and streamlit_image_coordinates is not None:
+        st.markdown("#### Correction de points - posture frontale")
+        disp_w = min(int(patient["display_width"]), img_rgb.shape[1])
+        scale = disp_w / img_rgb.shape[1]
+        disp_h = int(img_rgb.shape[0] * scale)
+        img_disp = cv2.resize(img_rgb, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+        preview = draw_preview(img_disp, origin_points, st.session_state["override_front_points"], scale)
+        coords = streamlit_image_coordinates(Image.open(io.BytesIO(to_png_bytes(preview))), key="front_click")
+        if coords is not None:
+            x_orig = float(coords["x"]) / scale
+            y_orig = float(coords["y"]) / scale
+            st.session_state["override_front_points"][patient["point_to_edit_front"]] = (x_orig, y_orig)
+            st.success(f"Point frontal {patient['point_to_edit_front']} placé à ({x_orig:.0f}, {y_orig:.0f}) px")
 
-    req = [
-        mp_pl.LEFT_SHOULDER.value, mp_pl.RIGHT_SHOULDER.value,
-        mp_pl.LEFT_HIP.value, mp_pl.RIGHT_HIP.value,
-        mp_pl.LEFT_ANKLE.value, mp_pl.RIGHT_ANKLE.value,
-        mp_pl.LEFT_EYE.value, mp_pl.RIGHT_EYE.value,
-        mp_pl.NOSE.value,
-    ]
-    if any(vis(lms[i]) < patient["conf"] for i in req):
-        return {
-            "title": "Analyse posturale frontale",
-            "status": "erreur",
-            "summary": "Détection insuffisante.",
-            "bullet_points": ["Certains points clés sont trop peu visibles pour une mesure fiable."],
-            "plots": [],
-            "annotated_images": [],
-            "metrics": {},
-        }
+    points = {k: np.array(v, dtype=np.float32) for k, v in origin_points.items()}
+    for k, v in st.session_state["override_front_points"].items():
+        if k in points:
+            points[k] = np.array([v[0], v[1]], dtype=np.float32)
 
-    Ls, Rs = xy(lms[mp_pl.LEFT_SHOULDER.value], w, h), xy(lms[mp_pl.RIGHT_SHOULDER.value], w, h)
-    Lh, Rh = xy(lms[mp_pl.LEFT_HIP.value], w, h), xy(lms[mp_pl.RIGHT_HIP.value], w, h)
-    La, Ra = xy(lms[mp_pl.LEFT_ANKLE.value], w, h), xy(lms[mp_pl.RIGHT_ANKLE.value], w, h)
-    Le, Re = xy(lms[mp_pl.LEFT_EYE.value], w, h), xy(lms[mp_pl.RIGHT_EYE.value], w, h)
-    nose = xy(lms[mp_pl.NOSE.value], w, h)
+    LS, RS = points["Hanche G"]*0 + origin_points["Epaule G"], points["Hanche D"]*0 + origin_points["Epaule D"]
+    LH, RH = points["Hanche G"], points["Hanche D"]
+    LK, RK = points["Genou G"], points["Genou D"]
+    LA, RA = points["Cheville G"], points["Cheville D"]
+    LHeel, RHeel = points["Talon G"], points["Talon D"]
 
-    shoulder_tilt = tilt_from_horizontal(Ls, Rs)
-    pelvis_tilt = tilt_from_horizontal(Lh, Rh)
-    head_tilt = tilt_from_horizontal(Le, Re)
-    body_mid = avg_point([avg_point([Ls, Rs]), avg_point([Lh, Rh]), avg_point([La, Ra])])
-    center_offset = nose[0] - body_mid[0]
-    ankle_width = abs(La[0] - Ra[0])
-    hip_width = abs(Lh[0] - Rh[0])
+    shoulder_tilt = tilt_from_horizontal(LS, RS)
+    pelvis_tilt = tilt_from_horizontal(LH, RH)
+    knee_g = angle_genou_frontal(LH, LK, LA, side="G")
+    knee_d = angle_genou_frontal(RH, RK, RA, side="D")
+    rear_g = angle_arriere_pied_frontal(LA, LHeel, side="G")
+    rear_d = angle_arriere_pied_frontal(RA, RHeel, side="D")
+    hip_width = abs(LH[0] - RH[0])
+    ankle_width = abs(LA[0] - RA[0])
 
-    ann_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    ann_bgr = draw_landmarks_basic(ann_bgr, result.pose_landmarks, w, h, patient["conf"])
+    ann_bgr = cv2.cvtColor(img_rgb.copy(), cv2.COLOR_RGB2BGR)
+    for _, p in points.items():
+        cv2.circle(ann_bgr, tuple(np.round(p).astype(int)), 7, (0, 255, 0), -1)
+    for name, p in st.session_state["override_front_points"].items():
+        arr = np.array(p)
+        cv2.circle(ann_bgr, tuple(np.round(arr).astype(int)), 14, (255, 0, 255), 3)
+        cv2.putText(ann_bgr, name, (int(arr[0]) + 8, int(arr[1]) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
     ann_path = os.path.join(tempfile.gettempdir(), "posture_frontale_annotee.png")
     cv2.imwrite(ann_path, ann_bgr)
 
     bullets = [
-        f"Inclinaison des épaules : {shoulder_tilt:.1f} deg",
-        f"Inclinaison du bassin : {pelvis_tilt:.1f} deg",
-        f"Inclinaison de la tête : {head_tilt:.1f} deg",
-        f"Décalage horizontal de la tête par rapport à l'axe corporel : {center_offset:.1f} px",
-        f"Largeur inter-chevilles : {ankle_width:.1f} px | largeur bassin : {hip_width:.1f} px",
+        f"Inclinaison epaules : {shoulder_tilt:.1f} deg",
+        f"Inclinaison bassin : {pelvis_tilt:.1f} deg",
+        f"Genou G : {knee_g:.1f} deg | Genou D : {knee_d:.1f} deg",
+        f"Arriere-pied G : {rear_g:.1f} deg | Arriere-pied D : {rear_d:.1f} deg",
+        f"Largeur bassin : {hip_width:.1f} px | largeur inter-chevilles : {ankle_width:.1f} px",
     ]
+    if st.session_state["override_front_points"]:
+        bullets.append(f"Points corriges manuellement : {', '.join(st.session_state['override_front_points'].keys())}")
 
     return {
         "title": "Analyse posturale frontale",
         "status": "ok",
-        "summary": "Analyse posturale frontale réalisée à partir des repères épaules, bassin, tête et chevilles.",
+        "summary": "Analyse statique frontale avec possibilité de correction manuelle des points avant calcul.",
         "bullet_points": bullets,
         "plots": [],
         "annotated_images": [ann_path],
-        "metrics": {
-            "shoulder_tilt": float(shoulder_tilt),
-            "pelvis_tilt": float(pelvis_tilt),
-            "head_tilt": float(head_tilt),
-            "center_offset": float(center_offset),
-        },
+        "metrics": {"shoulder_tilt": float(shoulder_tilt), "pelvis_tilt": float(pelvis_tilt), "knee_g": float(knee_g), "knee_d": float(knee_d)},
     }
+
 
 # ============================================================
 # ANALYSE POSTURALE LATÉRALE
@@ -724,75 +836,91 @@ def run_postural_side(image_path: Optional[str], patient: Dict[str, Any]) -> Dic
         }
 
     img_rgb = rotate_if_landscape(ensure_rgb(img_bgr))
-    result = POSE_IMAGE.process(img_rgb)
-    if not result.pose_landmarks:
+    res_for_crop = POSE_IMAGE.process(img_rgb)
+    if patient.get("auto_crop_static"):
+        img_rgb = crop_to_landmarks(img_rgb, res_for_crop, pad_ratio=0.18)
+
+    side_detected, origin_points = extract_points_side(img_rgb)
+    if origin_points is None:
         return {
             "title": "Analyse posturale latérale",
             "status": "erreur",
-            "summary": "Aucun squelette détecté.",
-            "bullet_points": ["MediaPipe n'a pas détecté correctement la posture."],
+            "summary": "Aucune pose détectée.",
+            "bullet_points": ["Utilisez une photo nette, de profil, en pied."],
             "plots": [],
             "annotated_images": [],
             "metrics": {},
         }
 
-    h, w = img_rgb.shape[:2]
-    lms = result.pose_landmarks.landmark
-    idx = side_indices(patient["camera_pos"])
+    if patient.get("click_edit_enabled") and streamlit_image_coordinates is not None:
+        st.markdown("#### Correction de points - posture latérale")
+        st.caption(f"Côté détecté : {'Gauche' if side_detected == 'left' else 'Droite'}")
+        disp_w = min(int(patient["display_width"]), img_rgb.shape[1])
+        scale = disp_w / img_rgb.shape[1]
+        disp_h = int(img_rgb.shape[0] * scale)
+        img_disp = cv2.resize(img_rgb, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+        preview = draw_preview(img_disp, origin_points, st.session_state["override_side_points"], scale)
+        coords = streamlit_image_coordinates(Image.open(io.BytesIO(to_png_bytes(preview))), key="side_click")
+        if coords is not None:
+            x_orig = float(coords["x"]) / scale
+            y_orig = float(coords["y"]) / scale
+            st.session_state["override_side_points"][patient["point_to_edit_side"]] = (x_orig, y_orig)
+            st.success(f"Point latéral {patient['point_to_edit_side']} placé à ({x_orig:.0f}, {y_orig:.0f}) px")
 
-    req = [idx["ear"], idx["shoulder"], idx["hip"], idx["knee"], idx["ankle"], idx["foot"]]
-    if any(vis(lms[i]) < patient["conf"] for i in req):
-        return {
-            "title": "Analyse posturale latérale",
-            "status": "erreur",
-            "summary": "Détection insuffisante.",
-            "bullet_points": ["Certains points clés sont trop peu visibles pour une mesure fiable."],
-            "plots": [],
-            "annotated_images": [],
-            "metrics": {},
-        }
+    points = {k: np.array(v, dtype=np.float32) for k, v in origin_points.items()}
+    for k, v in st.session_state["override_side_points"].items():
+        if k in points:
+            points[k] = np.array([v[0], v[1]], dtype=np.float32)
 
-    ear = xy(lms[idx["ear"]], w, h)
-    shoulder = xy(lms[idx["shoulder"]], w, h)
-    hip = xy(lms[idx["hip"]], w, h)
-    knee = xy(lms[idx["knee"]], w, h)
-    ankle = xy(lms[idx["ankle"]], w, h)
-    foot = xy(lms[idx["foot"]], w, h)
+    Epaule = points["Epaule"]; Hanche = points["Hanche"]; Genou = points["Genou"]
+    Cheville = points["Cheville"]; Talon = points["Talon"]; Oreille = points["Oreille"]; Nez = points["Nez"]
 
-    trunk_tilt = tilt_from_vertical(hip, shoulder)
-    head_forward = ear[0] - shoulder[0]
-    hip_angle = angle_3pts(shoulder, hip, knee)
-    knee_angle = angle_3pts(hip, knee, ankle)
-    ankle_angle = angle_3pts(knee, ankle, foot)
+    incl_jambe = abs(signed_angle_vs_vertical(Genou, Cheville))
+    incl_cuisse = abs(signed_angle_vs_vertical(Hanche, Genou))
+    incl_tronc = abs(signed_angle_vs_vertical(Hanche, Epaule))
+    incl_tete_cou = abs(signed_angle_vs_vertical(Epaule, Oreille))
+    incl_tete_nez = abs(signed_angle_vs_vertical(Oreille, Nez))
+    signed_tronc = signed_angle_vs_vertical(Hanche, Epaule)
+    signed_tete = signed_angle_vs_vertical(Epaule, Oreille)
+    angle_gen = angle( Hanche, Genou, Cheville)
+    angle_chev = angle(Genou, Cheville, Talon)
+    sens_tronc = "Vers l'avant" if signed_tronc > 0 else "Vers l'arriere"
+    sens_tete = "Vers l'avant" if signed_tete > 0 else "Vers l'arriere"
 
-    ann_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-    ann_bgr = draw_landmarks_basic(ann_bgr, result.pose_landmarks, w, h, patient["conf"])
+    ann_bgr = cv2.cvtColor(img_rgb.copy(), cv2.COLOR_RGB2BGR)
+    for _, p in points.items():
+        cv2.circle(ann_bgr, tuple(np.round(p).astype(int)), 7, (0, 255, 0), -1)
+    for name, p in st.session_state["override_side_points"].items():
+        arr = np.array(p)
+        cv2.circle(ann_bgr, tuple(np.round(arr).astype(int)), 14, (255, 0, 255), 3)
+        cv2.putText(ann_bgr, name, (int(arr[0]) + 8, int(arr[1]) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+    for a, b, color in [(Hanche, Epaule, (255,0,0)), (Hanche, Genou, (0,200,0)), (Genou, Cheville, (0,255,255)), (Epaule, Oreille, (255,0,255)), (Oreille, Nez, (100,255,100))]:
+        cv2.line(ann_bgr, tuple(np.round(a).astype(int)), tuple(np.round(b).astype(int)), color, 3)
     ann_path = os.path.join(tempfile.gettempdir(), "posture_laterale_annotee.png")
     cv2.imwrite(ann_path, ann_bgr)
 
     bullets = [
-        f"Inclinaison du tronc : {trunk_tilt:.1f} deg",
-        f"Projection avant de la tête (oreille vs épaule) : {head_forward:.1f} px",
-        f"Angle hanche : {hip_angle:.1f} deg",
-        f"Angle genou : {knee_angle:.1f} deg",
-        f"Angle cheville : {ankle_angle:.1f} deg",
+        f"Cote detecte : {'Gauche' if side_detected == 'left' else 'Droite'}",
+        f"Inclinaison jambe / verticale : {incl_jambe:.1f} deg",
+        f"Inclinaison cuisse / verticale : {incl_cuisse:.1f} deg",
+        f"Inclinaison tronc / verticale : {incl_tronc:.1f} deg ({sens_tronc})",
+        f"Inclinaison tete-cou / verticale : {incl_tete_cou:.1f} deg ({sens_tete})",
+        f"Inclinaison tete (oreille-nez) : {incl_tete_nez:.1f} deg",
+        f"Angle genou : {angle_gen:.1f} deg | Angle cheville : {angle_chev:.1f} deg",
     ]
+    if st.session_state["override_side_points"]:
+        bullets.append(f"Points corriges manuellement : {', '.join(st.session_state['override_side_points'].keys())}")
 
     return {
         "title": "Analyse posturale latérale",
         "status": "ok",
-        "summary": "Analyse posturale latérale réalisée à partir de l'alignement tête - tronc - membre inférieur.",
+        "summary": "Analyse statique latérale avec les mêmes angles de référence que l'application d'origine et correction manuelle possible.",
         "bullet_points": bullets,
         "plots": [],
         "annotated_images": [ann_path],
-        "metrics": {
-            "trunk_tilt": float(trunk_tilt),
-            "head_forward": float(head_forward),
-            "hip_angle": float(hip_angle),
-            "knee_angle": float(knee_angle),
-            "ankle_angle": float(ankle_angle),
-        },
+        "metrics": {"incl_tronc": float(incl_tronc), "angle_genou": float(angle_gen), "angle_cheville": float(angle_chev)},
     }
+
 
 # ============================================================
 # PDF GLOBAL
@@ -800,47 +928,46 @@ def run_postural_side(image_path: Optional[str], patient: Dict[str, Any]) -> Dic
 def build_global_pdf(patient: Dict[str, Any], results: List[Dict[str, Any]]) -> bytes:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=12)
-
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, pdf_safe("Compte-rendu global biomecanique"), ln=True)
     pdf.set_font("Arial", "", 11)
     patient_name = f"{patient['nom']} {patient['prenom']}".strip() or "Non renseigne"
-    pdf.cell(0, 8, pdf_safe(f"Patient : {patient_name}"), ln=True)
-    pdf.cell(0, 8, pdf_safe(f"Date : {datetime.now().strftime('%d/%m/%Y %H:%M')}"), ln=True)
-    pdf.cell(0, 8, pdf_safe(f"Taille : {patient['taille_cm']} cm"), ln=True)
-    pdf.multi_cell(
-        0,
-        7,
-        pdf_safe(
-            f"Parametres communs - seuil visibilite : {patient['conf']} | lissage : {patient['smooth']} | "
-            f"camera profil : {patient['camera_pos']} | phase : {patient['phase_cote']} | images exportees : {patient['num_photos']}"
-        ),
-    )
-    pdf.ln(3)
-
+    pdf_multicell_safe(pdf, f"Patient : {patient_name}")
+    pdf_multicell_safe(pdf, f"Date : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    pdf_multicell_safe(pdf, f"Taille : {patient['taille_cm']} cm")
+    pdf_multicell_safe(pdf, f"Parametres communs - seuil visibilite : {patient['conf']} | lissage : {patient['smooth']} | camera profil : {patient['camera_pos']} | phase : {patient['phase_cote']} | images exportees : {patient['num_photos']}")
+    pdf.ln(2)
     for result in results:
         pdf.set_font("Arial", "B", 13)
-        pdf.cell(0, 9, pdf_safe(result["title"]), ln=True)
+        pdf_multicell_safe(pdf, result["title"])
         pdf.set_font("Arial", "", 11)
-        pdf.multi_cell(0, 7, pdf_safe(result.get("summary", "")))
-        for bullet in result.get("bullet_points", []):
-            pdf.multi_cell(0, 7, pdf_safe(f"- {bullet}"))
+        pdf_multicell_safe(pdf, result.get("summary", ""))
+        bullets = result.get("bullet_points", []) or ["Non analyse"]
+        for bullet in bullets:
+            pdf_multicell_safe(pdf, f"- {bullet}")
         pdf.ln(2)
-
         for plot in result.get("plots", [])[:2]:
             if plot and os.path.exists(plot):
-                pdf.image(plot, w=180)
-                pdf.ln(3)
-
+                try:
+                    pdf.image(plot, w=180)
+                    pdf.ln(3)
+                except Exception:
+                    pass
         for img in result.get("annotated_images", [])[:2]:
             if img and os.path.exists(img):
-                pdf.image(img, w=110)
-                pdf.ln(3)
-
+                try:
+                    pdf.image(img, w=110)
+                    pdf.ln(3)
+                except Exception:
+                    pass
         pdf.ln(4)
-
-    return bytes(pdf.output(dest="S"))
+    out = pdf.output(dest="S")
+    if isinstance(out, bytearray):
+        return bytes(out)
+    if isinstance(out, str):
+        return out.encode("latin-1", errors="ignore")
+    return bytes(out)
 
 # ============================================================
 # RENDU STREAMLIT
