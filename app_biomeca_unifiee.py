@@ -3,6 +3,8 @@ import io
 import math
 import os
 import tempfile
+import re
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple
@@ -175,7 +177,10 @@ def safe_name(text: str) -> str:
 def pdf_safe(text: Any) -> str:
     if text is None:
         return ""
+    import unicodedata
     s = str(text)
+    s = unicodedata.normalize("NFKD", s)
+    s = s.replace("\xa0", " ").replace("\u202f", " ").replace("\r", "\n").replace("\t", " ")
     replacements = {
         "–": "-",
         "—": "-",
@@ -185,24 +190,48 @@ def pdf_safe(text: Any) -> str:
         "•": "-",
         "✅": "[OK]",
         "⚠️": "[!]",
-        "é": "e",
-        "è": "e",
-        "ê": "e",
-        "ë": "e",
-        "à": "a",
-        "â": "a",
-        "î": "i",
-        "ï": "i",
-        "ô": "o",
-        "ö": "o",
-        "ù": "u",
-        "û": "u",
-        "ç": "c",
         "°": " deg",
     }
     for a, b in replacements.items():
         s = s.replace(a, b)
-    return s
+    s = "".join(ch for ch in s if ord(ch) == 10 or 32 <= ord(ch) <= 126)
+    s = re.sub(r"[ ]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def wrap_pdf_text(text: Any, max_token: int = 40) -> str:
+    s = pdf_safe(text)
+    if not s:
+        return ""
+    parts = []
+    for raw_line in s.split("\n"):
+        words = []
+        for tok in raw_line.split(" "):
+            tok = tok.strip()
+            if not tok:
+                continue
+            if len(tok) > max_token:
+                words.extend(textwrap.wrap(tok, width=max_token, break_long_words=True, break_on_hyphens=False))
+            else:
+                words.append(tok)
+        parts.append(" ".join(words))
+    return "\n".join(parts)
+
+def safe_multi_cell(pdf: FPDF, w: float, h: float, text: Any) -> None:
+    content = wrap_pdf_text(text)
+    if not content:
+        return
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            pdf.ln(h)
+            continue
+        try:
+            pdf.multi_cell(w, h, line)
+        except Exception:
+            fallback = line.encode("ascii", "ignore").decode("ascii")[:180]
+            if fallback:
+                pdf.multi_cell(w, h, fallback)
 
 def interp_nan(arr: np.ndarray) -> np.ndarray:
     arr = np.asarray(arr, dtype=float)
@@ -247,13 +276,27 @@ def angle_3pts(a: Tuple[float, float], b: Tuple[float, float], c: Tuple[float, f
 
 
 def angle_hanche(epaule: Tuple[float, float], hanche: Tuple[float, float], genou: Tuple[float, float]) -> float:
-    return angle_3pts(epaule, hanche, genou)
+    ang = angle_3pts(epaule, hanche, genou)
+    return 180.0 - ang if not np.isnan(ang) else np.nan
 
 def angle_genou(hanche: Tuple[float, float], genou: Tuple[float, float], cheville: Tuple[float, float]) -> float:
-    return angle_3pts(hanche, genou, cheville)
+    ang = angle_3pts(hanche, genou, cheville)
+    return 180.0 - ang if not np.isnan(ang) else np.nan
 
-def angle_cheville(genou: Tuple[float, float], cheville: Tuple[float, float], pied: Tuple[float, float]) -> float:
-    return angle_3pts(genou, cheville, pied)
+def angle_between(v1: np.ndarray, v2: np.ndarray) -> float:
+    v1 = np.asarray(v1, dtype=float)
+    v2 = np.asarray(v2, dtype=float)
+    den = np.linalg.norm(v1) * np.linalg.norm(v2)
+    if den < 1e-9:
+        return np.nan
+    cosv = np.clip(np.dot(v1, v2) / den, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosv)))
+
+def angle_cheville(genou: Tuple[float, float], cheville: Tuple[float, float], talon: Tuple[float, float], orteil: Tuple[float, float]) -> float:
+    jambe = np.asarray(genou, dtype=float) - np.asarray(cheville, dtype=float)
+    pied = np.asarray(orteil, dtype=float) - np.asarray(talon, dtype=float)
+    ang = angle_between(jambe, pied)
+    return ang - 90.0 if not np.isnan(ang) else np.nan
 
 def angle_tronc(hanche: Tuple[float, float], epaule: Tuple[float, float]) -> float:
     return tilt_from_vertical(hanche, epaule)
@@ -426,9 +469,9 @@ def run_cinematic(video_path: Optional[str], patient: Dict[str, Any]) -> Dict[st
             pts[key] = xy(lm, w, h)
 
         if all_ok:
-            hip_angles.append(angle_3pts(pts["shoulder"], pts["hip"], pts["knee"]))
-            knee_angles.append(angle_3pts(pts["hip"], pts["knee"], pts["ankle"]))
-            ankle_angles.append(angle_3pts(pts["knee"], pts["ankle"], pts["foot"]))
+            hip_angles.append(angle_hanche(pts["shoulder"], pts["hip"], pts["knee"]))
+            knee_angles.append(angle_genou(pts["hip"], pts["knee"], pts["ankle"]))
+            ankle_angles.append(angle_cheville(pts["knee"], pts["ankle"], pts["heel"], pts["foot"]))
             trunk_tilts.append(tilt_from_vertical(pts["hip"], pts["shoulder"]))
             heel_y.append(pts["heel"][1])
         else:
@@ -754,7 +797,7 @@ def run_postural_side(image_path: Optional[str], patient: Dict[str, Any]) -> Dic
     lms = result.pose_landmarks.landmark
     idx = side_indices(patient["camera_pos"])
 
-    req = [idx["ear"], idx["shoulder"], idx["hip"], idx["knee"], idx["ankle"], idx["foot"]]
+    req = [idx["ear"], idx["shoulder"], idx["hip"], idx["knee"], idx["ankle"], idx["heel"], idx["foot"]]
     if any(vis(lms[i]) < patient["conf"] for i in req):
         return {
             "title": "Analyse posturale latérale",
@@ -771,13 +814,14 @@ def run_postural_side(image_path: Optional[str], patient: Dict[str, Any]) -> Dic
     hip = xy(lms[idx["hip"]], w, h)
     knee = xy(lms[idx["knee"]], w, h)
     ankle = xy(lms[idx["ankle"]], w, h)
+    heel = xy(lms[idx["heel"]], w, h)
     foot = xy(lms[idx["foot"]], w, h)
 
     trunk_tilt = tilt_from_vertical(hip, shoulder)
     head_forward = ear[0] - shoulder[0]
-    hip_angle = angle_3pts(shoulder, hip, knee)
-    knee_angle = angle_3pts(hip, knee, ankle)
-    ankle_angle = angle_3pts(knee, ankle, foot)
+    hip_angle = angle_hanche(shoulder, hip, knee)
+    knee_angle = angle_genou(hip, knee, ankle)
+    ankle_angle = angle_cheville(knee, ankle, heel, foot)
 
     ann_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     ann_bgr = draw_landmarks_basic(ann_bgr, result.pose_landmarks, w, h, patient["conf"])
@@ -823,23 +867,16 @@ def build_global_pdf(patient: Dict[str, Any], results: List[Dict[str, Any]]) -> 
     pdf.cell(0, 8, pdf_safe(f"Patient : {patient_name}"), ln=True)
     pdf.cell(0, 8, pdf_safe(f"Date : {datetime.now().strftime('%d/%m/%Y %H:%M')}"), ln=True)
     pdf.cell(0, 8, pdf_safe(f"Taille : {patient['taille_cm']} cm"), ln=True)
-    pdf.multi_cell(
-        0,
-        7,
-        pdf_safe(
-            f"Parametres communs - seuil visibilite : {patient['conf']} | lissage : {patient['smooth']} | "
-            f"camera profil : {patient['camera_pos']} | phase : {patient['phase_cote']} | images exportees : {patient['num_photos']}"
-        ),
-    )
+    safe_multi_cell(pdf, 0, 7, f"Parametres communs - seuil visibilite : {patient['conf']} | lissage : {patient['smooth']} | camera profil : {patient['camera_pos']} | phase : {patient['phase_cote']} | images exportees : {patient['num_photos']}")
     pdf.ln(3)
 
     for result in results:
         pdf.set_font("Arial", "B", 13)
         pdf.cell(0, 9, pdf_safe(result["title"]), ln=True)
         pdf.set_font("Arial", "", 11)
-        pdf.multi_cell(0, 7, pdf_safe(result.get("summary", "")))
+        safe_multi_cell(pdf, 0, 7, result.get("summary", ""))
         for bullet in result.get("bullet_points", []):
-            pdf.multi_cell(0, 7, pdf_safe(f"- {bullet}"))
+            safe_multi_cell(pdf, 0, 7, f"- {bullet}")
         pdf.ln(2)
 
         for plot in result.get("plots", [])[:2]:
