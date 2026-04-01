@@ -1,21 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Application biomécanique unifiée
---------------------------------
-Objectif :
-- 1 seule saisie des paramètres communs (nom, prénom, taille, confiance, lissage, etc.)
-- 4 chargements séparés
-- préserver la logique de calcul des 4 codes initiaux
-- exécuter chaque code d'origine depuis un seul fichier
-
-Principe :
-- les 4 scripts d'origine sont inclus ci-dessous, séparés automatiquement ;
-- un proxy Streamlit réinjecte les paramètres communs et le bon fichier d'entrée ;
-- les calculs internes des scripts legacy ne sont pas réécrits.
+Version monolithique explicite.
+- 1 seule saisie des paramètres communs
+- mêmes codes d'origine conservés dans 4 blocs explicites
+- aucune réécriture des calculs métier dans les blocs legacy
 """
 
 from __future__ import annotations
-
 import io
 import os
 import re
@@ -23,35 +14,2995 @@ import sys
 import types
 import traceback
 from datetime import datetime
-from typing import Any, Dict, List, Optional
 from contextlib import contextmanager
+from typing import Any, Dict, List
 
 import streamlit as st
 import streamlit.components.v1 as components
 from fpdf import FPDF
 
+
 # ============================================================
-# SOURCE LEGACY D'ORIGINE
+# BLOCS ORIGINAUX CONSERVÉS
 # ============================================================
-SOURCE_TEXT = r'# ==============================\n# IMPORTS\n# ==============================\nimport streamlit as st\nimport cv2, os, tempfile, base64\nimport numpy as np\nimport matplotlib.pyplot as plt\nfrom datetime import datetime\nfrom scipy.signal import find_peaks\nimport mediapipe as mp\n\nfrom reportlab.platypus import (\n    SimpleDocTemplate, Paragraph, Image as PDFImage,\n    Spacer, Table, TableStyle, PageBreak\n)\nfrom reportlab.lib.styles import getSampleStyleSheet\nfrom reportlab.lib.pagesizes import A4\nfrom reportlab.lib.units import cm\nfrom reportlab.lib import colors\n\nimport streamlit.components.v1 as components\n\n# ==============================\n# CONFIG\n# ==============================\nst.set_page_config("GaitScan Pro (Analyse frontale)", layout="wide")\nst.title("🏃 GaitScan Pro – Analyse Frontale / Vue arrière")\nFPS = 30\n\n# ==============================\n# MEDIAPIPE\n# ==============================\nmp_pose = mp.solutions.pose\n\n@st.cache_resource\ndef load_pose():\n    return mp_pose.Pose(\n        static_image_mode=False,\n        model_complexity=1,\n        smooth_landmarks=True,\n        min_detection_confidence=0.5,\n        min_tracking_confidence=0.5,\n    )\n\npose = load_pose()\n\n# ==============================\n# NORMES INDICATIVES\n# ==============================\ndef norm_curve(metric, n):\n    x = np.linspace(0, 100, n)\n\n    if metric in ["Genou G", "Genou D"]:\n        return np.interp(x, [0, 25, 50, 75, 100], [1, 4, 0, -4, 1])\n\n    if metric in ["Arriere-pied G", "Arriere-pied D"]:\n        return np.interp(x, [0, 25, 50, 75, 100], [0.5, 2, 0, -2, 0.5])\n\n    if metric == "Bassin":\n        return np.interp(x, [0, 25, 50, 75, 100], [0, 2, 0, -2, 0])\n\n    if metric == "Tronc":\n        return np.interp(x, [0, 25, 50, 75, 100], [0, 2, 0, -2, 0])\n\n    return np.zeros(n)\n\ndef smooth_ma(y, win=7):\n    y = np.asarray(y, dtype=float)\n    if win is None or win <= 1:\n        return y\n    win = int(win)\n    if win % 2 == 0:\n        win += 1\n    pad = win // 2\n    ypad = np.pad(y, (pad, pad), mode="edge")\n    kernel = np.ones(win, dtype=float) / win\n    return np.convolve(ypad, kernel, mode="valid")\n\n# ==============================\n# OUTLIERS + LISSAGE\n# ==============================\ndef interp_nan(arr):\n    arr = np.asarray(arr, dtype=float)\n    idx = np.arange(len(arr))\n    ok = ~np.isnan(arr)\n    if ok.sum() >= 2:\n        return np.interp(idx, idx[ok], arr[ok])\n    return np.zeros_like(arr)\n\ndef remove_outliers_hampel(x, win=5, n_sigmas=3.0):\n    x = np.asarray(x, dtype=float).copy()\n    n = len(x)\n    if n < 3:\n        return x\n\n    y = x.copy()\n    k = 1.4826\n\n    for i in range(n):\n        i0 = max(0, i - win)\n        i1 = min(n, i + win + 1)\n        w = x[i0:i1]\n        med = np.median(w)\n        mad = np.median(np.abs(w - med))\n\n        if mad < 1e-9:\n            continue\n\n        if abs(x[i] - med) > n_sigmas * k * mad:\n            y[i] = med\n\n    return y\n\ndef smooth_clinical(arr, smooth_level=3):\n    x = interp_nan(arr)\n    x = remove_outliers_hampel(x, win=3 + smooth_level, n_sigmas=3.0)\n    win = max(3, 2 * smooth_level + 3)\n    if win % 2 == 0:\n        win += 1\n    return smooth_ma(x, win=win)\n\n# ==============================\n# POSE DETECTION\n# ==============================\ndef detect_pose(frame):\n    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)\n    res = pose.process(img_rgb)\n    if not res.pose_landmarks:\n        return None\n\n    lm = res.pose_landmarks.landmark\n    L = mp_pose.PoseLandmark\n\n    def pt(l):\n        p = lm[int(l)]\n        return np.array([p.x, p.y], dtype=np.float32), float(p.visibility)\n\n    kp = {}\n    for side, suf in [("LEFT", "G"), ("RIGHT", "D")]:\n        kp[f"Epaule {suf}"], kp[f"Epaule {suf} vis"] = pt(getattr(L, f"{side}_SHOULDER"))\n        kp[f"Hanche {suf}"], kp[f"Hanche {suf} vis"] = pt(getattr(L, f"{side}_HIP"))\n        kp[f"Genou {suf}"], kp[f"Genou {suf} vis"] = pt(getattr(L, f"{side}_KNEE"))\n        kp[f"Cheville {suf}"], kp[f"Cheville {suf} vis"] = pt(getattr(L, f"{side}_ANKLE"))\n        kp[f"Talon {suf}"], kp[f"Talon {suf} vis"] = pt(getattr(L, f"{side}_HEEL"))\n        kp[f"Orteil {suf}"], kp[f"Orteil {suf} vis"] = pt(getattr(L, f"{side}_FOOT_INDEX"))\n    return kp\n\n# ==============================\n# ANGLES FRONTAUX\n# ==============================\ndef angle_3pts(a, b, c):\n    """\n    Angle géométrique (0-180°) au point b entre les segments b->a et b->c.\n    """\n    ba = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)\n    bc = np.asarray(c, dtype=float) - np.asarray(b, dtype=float)\n\n    # repère image -> repère math\n    ba[1] *= -1\n    bc[1] *= -1\n\n    denom = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-9\n    cosv = np.dot(ba, bc) / denom\n    cosv = np.clip(cosv, -1.0, 1.0)\n    return float(np.degrees(np.arccos(cosv)))\n\ndef signed_angle_vs_vertical(p1, p2):\n    """\n    Angle signé du segment p1->p2 par rapport à la verticale.\n    """\n    v = np.asarray(p2, dtype=float) - np.asarray(p1, dtype=float)\n    vx = v[0]\n    vy = -(v[1])\n    return float(np.degrees(np.arctan2(vx, vy + 1e-9)))\n\ndef signed_angle_vs_horizontal(p1, p2):\n    """\n    Angle signé du segment p1->p2 par rapport à l\'horizontale.\n    """\n    v = np.asarray(p2, dtype=float) - np.asarray(p1, dtype=float)\n    vx = v[0]\n    vy = -(v[1])\n    return float(np.degrees(np.arctan2(vy, vx + 1e-9)))\n\ndef angle_genou_frontal(hip, knee, ankle, side=None):\n    """\n    Déviation frontale du genou = angle cuisse/jambe.\n    0° ~ alignement neutre.\n    """\n    raw = angle_3pts(hip, knee, ankle)   # proche de 180 si aligné\n    dev = 180.0 - raw                    # proche de 0 si aligné\n\n    hip = np.asarray(hip, dtype=float)\n    knee = np.asarray(knee, dtype=float)\n    ankle = np.asarray(ankle, dtype=float)\n\n    # Signe basé sur la position du genou par rapport à la ligne hanche-cheville\n    v1 = knee - hip\n    v2 = ankle - hip\n    cross = v1[0] * v2[1] - v1[1] * v2[0]\n\n    if side == "G":\n        sign = -1.0 if cross > 0 else 1.0\n    elif side == "D":\n        sign = 1.0 if cross > 0 else -1.0\n    else:\n        sign = 1.0 if cross > 0 else -1.0\n\n    return float(sign * abs(dev))\n\ndef angle_arriere_pied_frontal(ankle, heel, side=None):\n    """\n    Déviation frontale stable de l\'arrière-pied par rapport à la verticale.\n    On utilise le segment talon -> cheville, avec formule stable\n    pour éviter les sauts absurdes de type atan2 sur quadrant.\n    """\n    ankle = np.asarray(ankle, dtype=float)\n    heel = np.asarray(heel, dtype=float)\n\n    # segment talon -> cheville\n    v = ankle - heel\n    dx = v[0]\n    dy = v[1]\n\n    # déviation par rapport à la verticale, version stable\n    ang = np.degrees(np.arctan2(dx, abs(dy) + 1e-9))\n\n    # harmonisation visuelle G/D\n    if side == "G":\n        ang = -ang\n\n    return float(ang)\n\ndef angle_bassin_frontal(hipL, hipR):\n    """\n    Obliquité pelvienne.\n    """\n    return signed_angle_vs_horizontal(hipL, hipR)\n\ndef angle_tronc_frontal(shL, shR, hipL, hipR):\n    """\n    Inclinaison latérale du tronc.\n    """\n    mid_sh = (np.asarray(shL) + np.asarray(shR)) / 2.0\n    mid_hip = (np.asarray(hipL) + np.asarray(hipR)) / 2.0\n    return signed_angle_vs_vertical(mid_hip, mid_sh)\n\n# ==============================\n# CONTACTS SOL + CYCLE\n# ==============================\ndef detect_foot_contacts(y, fps=FPS):\n    y = np.asarray(y, dtype=float)\n\n    if np.isnan(y).any():\n        idx = np.arange(len(y))\n        ok = ~np.isnan(y)\n        if ok.sum() >= 2:\n            y = np.interp(idx, idx[ok], y[ok])\n        else:\n            return np.array([], dtype=int), y\n\n    y_s = smooth_clinical(y, smooth_level=2)\n\n    inv = -y_s\n    min_distance = max(1, int(0.35 * fps))\n    prominence = max(1e-6, np.std(inv) * 0.2)\n\n    peaks, _ = find_peaks(inv, distance=min_distance, prominence=prominence)\n    return peaks, y_s\n\ndef compute_step_times(contact_idx, fps=FPS):\n    contact_idx = np.asarray(contact_idx, dtype=int)\n    if len(contact_idx) < 2:\n        return [], None, None\n\n    step_times = np.diff(contact_idx) / float(fps)\n    return step_times.tolist(), float(np.mean(step_times)), float(np.std(step_times))\n\ndef detect_cycle(y):\n    contacts, _ = detect_foot_contacts(y, fps=FPS)\n    if len(contacts) < 2:\n        return None\n\n    mid = len(contacts) // 2\n    if mid == 0:\n        return int(contacts[0]), int(contacts[1])\n\n    return int(contacts[mid - 1]), int(contacts[mid])\n\n# ==============================\n# VIDEO PROCESS\n# ==============================\ndef process_video(path, conf):\n    cap = cv2.VideoCapture(path)\n\n    res = {\n        "Genou G": [],\n        "Genou D": [],\n        "Arriere-pied G": [],\n        "Arriere-pied D": [],\n        "Bassin": [],\n        "Tronc": [],\n    }\n\n    heelG_y, heelD_y = [], []\n    frames = []\n\n    while cap.isOpened():\n        r, f = cap.read()\n        if not r:\n            break\n        frames.append(f.copy())\n\n        kp = detect_pose(f)\n        if kp is None:\n            for k in res:\n                res[k].append(np.nan)\n            heelG_y.append(np.nan)\n            heelD_y.append(np.nan)\n            continue\n\n        def ok(n):\n            return kp.get(f"{n} vis", 0.0) >= conf\n\n        # Genou frontal = angle cuisse / jambe\n        res["Genou G"].append(\n            angle_genou_frontal(kp["Hanche G"], kp["Genou G"], kp["Cheville G"], side="G")\n            if (ok("Hanche G") and ok("Genou G") and ok("Cheville G")) else np.nan\n        )\n        res["Genou D"].append(\n            angle_genou_frontal(kp["Hanche D"], kp["Genou D"], kp["Cheville D"], side="D")\n            if (ok("Hanche D") and ok("Genou D") and ok("Cheville D")) else np.nan\n        )\n\n        # Arrière-pied frontal stable\n        res["Arriere-pied G"].append(\n            angle_arriere_pied_frontal(kp["Cheville G"], kp["Talon G"], side="G")\n            if (ok("Cheville G") and ok("Talon G")) else np.nan\n        )\n        res["Arriere-pied D"].append(\n            angle_arriere_pied_frontal(kp["Cheville D"], kp["Talon D"], side="D")\n            if (ok("Cheville D") and ok("Talon D")) else np.nan\n        )\n\n        # Bassin\n        res["Bassin"].append(\n            angle_bassin_frontal(kp["Hanche G"], kp["Hanche D"])\n            if (ok("Hanche G") and ok("Hanche D")) else np.nan\n        )\n\n        # Tronc\n        res["Tronc"].append(\n            angle_tronc_frontal(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"])\n            if (ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D")) else np.nan\n        )\n\n        heelG_y.append(float(kp["Talon G"][1]) if ok("Talon G") else np.nan)\n        heelD_y.append(float(kp["Talon D"][1]) if ok("Talon D") else np.nan)\n\n    cap.release()\n    return res, heelG_y, heelD_y, frames\n\n# ==============================\n# ANNOTATION IMAGES\n# ==============================\ndef draw_segment_with_angle(img_bgr, p1, p2, ang_deg, label, color=(0, 255, 0)):\n    h, w = img_bgr.shape[:2]\n    P1 = (int(p1[0] * w), int(p1[1] * h))\n    P2 = (int(p2[0] * w), int(p2[1] * h))\n\n    cv2.line(img_bgr, P1, P2, color, 4)\n    cv2.circle(img_bgr, P1, 6, (0, 0, 255), -1)\n    cv2.circle(img_bgr, P2, 6, (0, 0, 255), -1)\n\n    txt = f"{label}: {ang_deg:.1f}°"\n    tx, ty = P2[0] + 10, P2[1] - 10\n    cv2.rectangle(img_bgr, (tx - 4, ty - 30), (tx + 190, ty + 6), (0, 0, 0), -1)\n    cv2.putText(\n        img_bgr, txt, (tx, ty),\n        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA\n    )\n\ndef annotate_frame(frame_bgr, kp, conf=0.30):\n    if kp is None:\n        return frame_bgr\n\n    def ok(n):\n        return kp.get(f"{n} vis", 0.0) >= conf\n\n    out = frame_bgr.copy()\n\n    # Genou G\n    if ok("Hanche G") and ok("Genou G") and ok("Cheville G"):\n        draw_segment_with_angle(\n            out, kp["Hanche G"], kp["Genou G"],\n            angle_genou_frontal(kp["Hanche G"], kp["Genou G"], kp["Cheville G"], side="G"),\n            "Genou G"\n        )\n        h, w = out.shape[:2]\n        K = (int(kp["Genou G"][0] * w), int(kp["Genou G"][1] * h))\n        A = (int(kp["Cheville G"][0] * w), int(kp["Cheville G"][1] * h))\n        cv2.line(out, K, A, (0, 255, 0), 4)\n\n    # Genou D\n    if ok("Hanche D") and ok("Genou D") and ok("Cheville D"):\n        draw_segment_with_angle(\n            out, kp["Hanche D"], kp["Genou D"],\n            angle_genou_frontal(kp["Hanche D"], kp["Genou D"], kp["Cheville D"], side="D"),\n            "Genou D"\n        )\n        h, w = out.shape[:2]\n        K = (int(kp["Genou D"][0] * w), int(kp["Genou D"][1] * h))\n        A = (int(kp["Cheville D"][0] * w), int(kp["Cheville D"][1] * h))\n        cv2.line(out, K, A, (0, 255, 0), 4)\n\n    # Arrière-pied G\n    if ok("Cheville G") and ok("Talon G"):\n        draw_segment_with_angle(\n            out, kp["Talon G"], kp["Cheville G"],\n            angle_arriere_pied_frontal(kp["Cheville G"], kp["Talon G"], side="G"),\n            "AP G"\n        )\n\n    # Arrière-pied D\n    if ok("Cheville D") and ok("Talon D"):\n        draw_segment_with_angle(\n            out, kp["Talon D"], kp["Cheville D"],\n            angle_arriere_pied_frontal(kp["Cheville D"], kp["Talon D"], side="D"),\n            "AP D"\n        )\n\n    # Bassin\n    if ok("Hanche G") and ok("Hanche D"):\n        draw_segment_with_angle(\n            out, kp["Hanche G"], kp["Hanche D"],\n            angle_bassin_frontal(kp["Hanche G"], kp["Hanche D"]),\n            "Bassin"\n        )\n\n    # Tronc\n    if ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D"):\n        mid_sh = (kp["Epaule G"] + kp["Epaule D"]) / 2.0\n        mid_hip = (kp["Hanche G"] + kp["Hanche D"]) / 2.0\n        draw_segment_with_angle(\n            out, mid_hip, mid_sh,\n            angle_tronc_frontal(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"]),\n            "Tronc"\n        )\n\n    return out\n\n# ==============================\n# ASYMETRIE\n# ==============================\ndef asym_percent(left, right):\n    if left is None or right is None:\n        return None\n    denom = (left + right) / 2.0\n    if abs(denom) < 1e-6:\n        return None\n    return 100.0 * abs(right - left) / abs(denom)\n\n# ==============================\n# PDF EXPORT\n# ==============================\ndef export_pdf(patient, keyframe_path, figures, table_data, annotated_images,\n               asym_table=None, temporal_info=None, contact_fig_path=None):\n    out_path = os.path.join(tempfile.gettempdir(), f"GaitScan_{patient[\'nom\']}_{patient[\'prenom\']}.pdf")\n\n    doc = SimpleDocTemplate(\n        out_path, pagesize=A4,\n        leftMargin=1.7 * cm, rightMargin=1.7 * cm,\n        topMargin=1.7 * cm, bottomMargin=1.7 * cm\n    )\n\n    styles = getSampleStyleSheet()\n    story = []\n\n    story.append(Paragraph("<b>GaitScan Pro – Analyse Frontale / Vue arrière</b>", styles["Title"]))\n    story.append(Spacer(1, 0.2 * cm))\n\n    story.append(Paragraph(\n        f"<b>Patient :</b> {patient[\'nom\']} {patient[\'prenom\']}<br/>"\n        f"<b>Date :</b> {datetime.now().strftime(\'%d/%m/%Y\')}<br/>"\n        f"<b>Angle de film :</b> {patient.get(\'camera\',\'N/A\')}<br/>"\n        f"<b>Affichage phases :</b> {patient.get(\'phase\',\'N/A\')}<br/>"\n        f"<b>Norme affichée :</b> {\'Oui\' if patient.get(\'show_norm\', True) else \'Non\'}<br/>"\n        f"<b>Taille :</b> {patient.get(\'taille_cm\',\'N/A\')} cm",\n        styles["Normal"]\n    ))\n    story.append(Spacer(1, 0.35 * cm))\n\n    if temporal_info is not None:\n        story.append(Paragraph("<b>Paramètres temporels</b>", styles["Heading2"]))\n        txt = ""\n\n        if temporal_info.get("G_mean") is not None:\n            txt += (\n                f"<b>Temps du pas Gauche :</b> {temporal_info[\'G_mean\']:.2f} s "\n                f"(± {temporal_info[\'G_std\']:.2f} s)<br/>"\n            )\n        else:\n            txt += "<b>Temps du pas Gauche :</b> non calculable<br/>"\n\n        if temporal_info.get("D_mean") is not None:\n            txt += (\n                f"<b>Temps du pas Droit :</b> {temporal_info[\'D_mean\']:.2f} s "\n                f"(± {temporal_info[\'D_std\']:.2f} s)<br/>"\n            )\n        else:\n            txt += "<b>Temps du pas Droit :</b> non calculable<br/>"\n\n        txt += (\n            f"<b>Contacts détectés :</b> Gauche = {temporal_info.get(\'nG\', 0)} "\n            f"&nbsp;&nbsp; Droit = {temporal_info.get(\'nD\', 0)}<br/>"\n            "<i>Les contacts au sol sont estimés à partir des minima verticaux des talons.</i>"\n        )\n\n        story.append(Paragraph(txt, styles["Normal"]))\n        story.append(Spacer(1, 0.25 * cm))\n\n    if contact_fig_path is not None and os.path.exists(contact_fig_path):\n        story.append(Paragraph("<b>Contacts au sol (talons)</b>", styles["Heading2"]))\n        story.append(PDFImage(contact_fig_path, width=16 * cm, height=6 * cm))\n        story.append(Spacer(1, 0.3 * cm))\n\n    if asym_table:\n        story.append(Paragraph("<b>Asymétries droite/gauche</b>", styles["Heading2"]))\n        t = Table([["Mesure", "Moy G", "Moy D", "Asym %"]] + asym_table,\n                  colWidths=[6 * cm, 3 * cm, 3 * cm, 3 * cm])\n        t.setStyle(TableStyle([\n            ("GRID", (0, 0), (-1, -1), 0.7, colors.black),\n            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),\n            ("ALIGN", (1, 1), (-1, -1), "CENTER")\n        ]))\n        story.append(t)\n        story.append(Spacer(1, 0.35 * cm))\n\n    story.append(Paragraph("<b>Image clé</b>", styles["Heading2"]))\n    story.append(PDFImage(keyframe_path, width=16 * cm, height=8 * cm))\n    story.append(Spacer(1, 0.4 * cm))\n\n    story.append(Paragraph("<b>Analyse frontale</b>", styles["Heading2"]))\n    story.append(Spacer(1, 0.2 * cm))\n    for joint, figpath in figures.items():\n        story.append(Paragraph(f"<b>{joint}</b>", styles["Heading3"]))\n        story.append(PDFImage(figpath, width=16 * cm, height=6 * cm))\n        story.append(Spacer(1, 0.3 * cm))\n\n    story.append(Spacer(1, 0.2 * cm))\n    story.append(Paragraph("<b>Synthèse (°)</b>", styles["Heading2"]))\n\n    table = Table([["Mesure", "Min", "Moyenne", "Max"]] + table_data,\n                  colWidths=[7 * cm, 3 * cm, 3 * cm, 3 * cm])\n    table.setStyle(TableStyle([\n        ("GRID", (0, 0), (-1, -1), 0.7, colors.black),\n        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),\n        ("ALIGN", (1, 1), (-1, -1), "CENTER")\n    ]))\n    story.append(table)\n\n    if annotated_images:\n        story.append(PageBreak())\n        story.append(Paragraph("<b>Images annotées</b>", styles["Heading2"]))\n        story.append(Spacer(1, 0.2 * cm))\n        for img in annotated_images:\n            story.append(PDFImage(img, width=16 * cm, height=8 * cm))\n            story.append(Spacer(1, 0.25 * cm))\n\n    doc.build(story)\n    return out_path\n\n# ==============================\n# PDF VIEW + PRINT\n# ==============================\ndef pdf_viewer_with_print(pdf_bytes: bytes, height=800):\n    b64 = base64.b64encode(pdf_bytes).decode("utf-8")\n    html = f"""\n    <div style="display:flex; gap:12px; align-items:center; margin: 6px 0 10px 0;">\n      <button onclick="printPdf()" style="padding:10px 14px; font-size:16px; cursor:pointer;">\n        🖨️ Imprimer le rapport\n      </button>\n      <span style="opacity:0.7;">(ouvre la boîte d’impression du navigateur)</span>\n    </div>\n    <iframe id="pdfFrame" src="data:application/pdf;base64,{b64}" width="100%" height="{height}px" style="border:1px solid #ddd; border-radius:8px;"></iframe>\n    <script>\n      function printPdf() {{\n        const iframe = document.getElementById(\'pdfFrame\');\n        iframe.contentWindow.focus();\n        iframe.contentWindow.print();\n      }}\n    </script>\n    """\n    components.html(html, height=height + 80, scrolling=True)\n\n# ==============================\n# UI\n# ==============================\nwith st.sidebar:\n    nom = st.text_input("Nom", "DURAND")\n    prenom = st.text_input("Prénom", "Jean")\n    camera_pos = st.selectbox("Angle de film", ["Devant", "Derrière"])\n    phase_cote = st.selectbox("Phases", ["Aucune", "Droite", "Gauche", "Les deux"])\n    smooth = st.slider("Lissage (patient)", 0, 10, 3)\n    conf = st.slider("Seuil confiance", 0.1, 0.9, 0.3, 0.05)\n\n    taille_cm = st.number_input("Taille du patient (cm)", min_value=80, max_value=230, value=170, step=1)\n\n    show_norm = st.checkbox("Afficher la norme", value=True)\n    norm_smooth_win = st.slider(\n        "Lissage norme (simple)", 1, 21, 7, 2,\n        help="Moyenne glissante. 1 = pas de lissage."\n    )\n\nvideo = st.file_uploader("Vidéo", ["mp4", "avi", "mov"])\n\n# ==============================\n# ANALYSE\n# ==============================\nif video and st.button("▶ Lancer l\'analyse"):\n    tmp = tempfile.NamedTemporaryFile(delete=False)\n    tmp.write(video.read())\n    tmp.close()\n\n    data, heelG, heelD, frames = process_video(tmp.name, conf)\n    os.unlink(tmp.name)\n\n    contactsG, heelG_s = detect_foot_contacts(heelG, fps=FPS)\n    contactsD, heelD_s = detect_foot_contacts(heelD, fps=FPS)\n\n    step_times_G, step_time_G_mean, step_time_G_std = compute_step_times(contactsG, fps=FPS)\n    step_times_D, step_time_D_mean, step_time_D_std = compute_step_times(contactsD, fps=FPS)\n\n    phases = []\n    if phase_cote in ["Gauche", "Les deux"]:\n        c = detect_cycle(heelG)\n        if c:\n            phases.append((*c, "orange"))\n    if phase_cote in ["Droite", "Les deux"]:\n        c = detect_cycle(heelD)\n        if c:\n            phases.append((*c, "blue"))\n\n    st.subheader("📐 Paramètres frontaux")\n    st.caption("Analyse frontale : genou (angle cuisse-jambe), arrière-pied, bassin et tronc.")\n\n    st.subheader("⏱️ Temps du pas")\n    col1, col2 = st.columns(2)\n\n    with col1:\n        if step_time_G_mean is not None:\n            st.write(f"**Temps du pas Gauche :** {step_time_G_mean:.2f} s")\n            st.write(f"**Variabilité Gauche :** ± {step_time_G_std:.2f} s")\n            st.write(f"**Nombre de contacts Gauche :** {len(contactsG)}")\n        else:\n            st.write("**Temps du pas Gauche :** non calculable")\n\n    with col2:\n        if step_time_D_mean is not None:\n            st.write(f"**Temps du pas Droit :** {step_time_D_mean:.2f} s")\n            st.write(f"**Variabilité Droit :** ± {step_time_D_std:.2f} s")\n            st.write(f"**Nombre de contacts Droit :** {len(contactsD)}")\n        else:\n            st.write("**Temps du pas Droit :** non calculable")\n\n    st.caption("Les contacts au sol sont estimés à partir des minima verticaux des talons.")\n\n    keyframe_path = os.path.join(tempfile.gettempdir(), "keyframe.png")\n    cv2.imwrite(keyframe_path, frames[len(frames) // 2])\n\n    figures = {}\n    table_data = []\n    asym_rows = []\n\n    metrics_pairs = [\n        ("Genou", "Genou G", "Genou D"),\n        ("Arriere-pied", "Arriere-pied G", "Arriere-pied D"),\n    ]\n\n    metrics_single = [\n        ("Bassin", "Bassin"),\n        ("Tronc", "Tronc"),\n    ]\n\n    # Courbes bilatérales\n    for label, left_key, right_key in metrics_pairs:\n        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})\n\n        g_raw = np.array(data[left_key], dtype=float)\n        d_raw = np.array(data[right_key], dtype=float)\n\n        local_smooth = smooth + 2 if label == "Arriere-pied" else smooth\n        g = smooth_clinical(g_raw, smooth_level=local_smooth)\n        d = smooth_clinical(d_raw, smooth_level=local_smooth)\n\n        ax1.plot(g, label="Gauche", color="red")\n        ax1.plot(d, label="Droite", color="blue")\n        ax1.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)\n        ax1.set_ylim(-25, 25)\n        for c0, c1, col in phases:\n            ax1.axvspan(c0, c1, color=col, alpha=0.3)\n        ax1.set_title(f"{label} – Analyse frontale")\n        ax1.set_ylabel("Angle (°)")\n        ax1.legend()\n\n        if show_norm:\n            norm = norm_curve(left_key, len(g))\n            norm = smooth_ma(norm, win=norm_smooth_win)\n            ax2.plot(norm, color="green")\n            ax2.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)\n            ax2.set_ylim(-25, 25)\n            ax2.set_title("Norme (indicative)")\n        else:\n            ax2.axis("off")\n\n        st.pyplot(fig)\n\n        fig_path = os.path.join(tempfile.gettempdir(), f"{label}_plot.png")\n        fig.savefig(fig_path, bbox_inches="tight")\n        plt.close(fig)\n        figures[label] = fig_path\n\n        def stats(arr_filtered, arr_raw):\n            mask = ~np.isnan(arr_raw)\n            if mask.sum() == 0:\n                return np.nan, np.nan, np.nan, None\n            vals = arr_filtered[mask]\n            return float(np.min(vals)), float(np.mean(vals)), float(np.max(vals)), float(np.mean(vals))\n\n        gmin, gmean, gmax, gmean_only = stats(g, g_raw)\n        dmin, dmean, dmax, dmean_only = stats(d, d_raw)\n\n        table_data.append([f"{label} Gauche", f"{gmin:.1f}", f"{gmean:.1f}", f"{gmax:.1f}"])\n        table_data.append([f"{label} Droite", f"{dmin:.1f}", f"{dmean:.1f}", f"{dmax:.1f}"])\n\n        a = asym_percent(gmean_only, dmean_only)\n        if a is None:\n            asym_rows.append([\n                label,\n                f"{gmean_only:.1f}" if gmean_only is not None else "NA",\n                f"{dmean_only:.1f}" if dmean_only is not None else "NA",\n                "NA"\n            ])\n        else:\n            asym_rows.append([label, f"{gmean_only:.1f}", f"{dmean_only:.1f}", f"{a:.1f}"])\n\n    # Courbes globales\n    for label, key in metrics_single:\n        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})\n\n        raw = np.array(data[key], dtype=float)\n        val = smooth_clinical(raw, smooth_level=smooth)\n\n        ax1.plot(val, label=label, color="purple")\n        ax1.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)\n        ax1.set_ylim(-15, 15)\n        for c0, c1, col in phases:\n            ax1.axvspan(c0, c1, color=col, alpha=0.3)\n        ax1.set_title(f"{label} – Analyse frontale")\n        ax1.set_ylabel("Angle (°)")\n        ax1.legend()\n\n        if show_norm:\n            norm = norm_curve(key, len(val))\n            norm = smooth_ma(norm, win=norm_smooth_win)\n            ax2.plot(norm, color="green")\n            ax2.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)\n            ax2.set_ylim(-15, 15)\n            ax2.set_title("Norme (indicative)")\n        else:\n            ax2.axis("off")\n\n        st.pyplot(fig)\n\n        fig_path = os.path.join(tempfile.gettempdir(), f"{label}_plot.png")\n        fig.savefig(fig_path, bbox_inches="tight")\n        plt.close(fig)\n        figures[label] = fig_path\n\n        mask = ~np.isnan(raw)\n        if mask.sum() == 0:\n            vmin = vmean = vmax = np.nan\n        else:\n            vals = val[mask]\n            vmin = float(np.min(vals))\n            vmean = float(np.mean(vals))\n            vmax = float(np.max(vals))\n\n        table_data.append([label, f"{vmin:.1f}", f"{vmean:.1f}", f"{vmax:.1f}"])\n\n    st.subheader("↔️ Asymétries droite/gauche")\n    for row in asym_rows:\n        st.write(f"**{row[0]}** — Moy G: {row[1]}° | Moy D: {row[2]}° | Asym: {row[3]}%")\n\n    st.subheader("🦶 Contacts au sol (talons)")\n    fig_contact, ax = plt.subplots(figsize=(12, 4))\n\n    x = np.arange(len(heelG_s)) / FPS\n    ax.plot(x, heelG_s, label="Talon Gauche", color="red")\n    ax.plot(x, heelD_s, label="Talon Droit", color="blue")\n\n    if len(contactsG) > 0:\n        ax.plot(contactsG / FPS, heelG_s[contactsG], "o", color="red")\n    for c in contactsG:\n        ax.axvline(c / FPS, color="red", alpha=0.15)\n\n    if len(contactsD) > 0:\n        ax.plot(contactsD / FPS, heelD_s[contactsD], "o", color="blue")\n    for c in contactsD:\n        ax.axvline(c / FPS, color="blue", alpha=0.15)\n\n    ax.set_title("Détection des contacts au sol")\n    ax.set_xlabel("Temps (s)")\n    ax.legend()\n    st.pyplot(fig_contact)\n\n    contact_fig_path = os.path.join(tempfile.gettempdir(), "contacts_sol.png")\n    fig_contact.savefig(contact_fig_path, bbox_inches="tight")\n    plt.close(fig_contact)\n\n    st.subheader("📸 Captures annotées")\n    num_photos = st.slider("Nombre d\'images extraites", 1, 10, 3)\n    total_frames = len(frames)\n    idxs = np.linspace(0, total_frames - 1, num_photos, dtype=int)\n\n    annotated_images = []\n    for i, idx in enumerate(idxs):\n        frame = frames[idx]\n        kp = detect_pose(frame)\n        ann = annotate_frame(frame, kp, conf=conf)\n\n        out_img = os.path.join(tempfile.gettempdir(), f"annotated_{i}.png")\n        cv2.imwrite(out_img, ann)\n        annotated_images.append(out_img)\n\n        st.image(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB), caption=f"Image annotée {i+1} (frame {idx})")\n\n    temporal_info = {\n        "G_mean": step_time_G_mean,\n        "G_std": step_time_G_std,\n        "D_mean": step_time_D_mean,\n        "D_std": step_time_D_std,\n        "nG": len(contactsG),\n        "nD": len(contactsD),\n    }\n\n    pdf_path = export_pdf(\n        patient={\n            "nom": nom,\n            "prenom": prenom,\n            "camera": camera_pos,\n            "phase": phase_cote,\n            "taille_cm": int(taille_cm),\n            "show_norm": bool(show_norm)\n        },\n        keyframe_path=keyframe_path,\n        figures=figures,\n        table_data=table_data,\n        annotated_images=annotated_images,\n        asym_table=asym_rows,\n        temporal_info=temporal_info,\n        contact_fig_path=contact_fig_path\n    )\n\n    with open(pdf_path, "rb") as f:\n        pdf_bytes = f.read()\n\n    st.success("✅ Rapport généré")\n    st.download_button(\n        "📄 Télécharger le rapport PDF",\n        data=pdf_bytes,\n        file_name=f"GaitScan_{nom}_{prenom}.pdf",\n        mime="application/pdf"\n    )\n\n\n\n====================================\n\n# ==============================\n# IMPORTS\n# ==============================\nimport streamlit as st\nimport cv2, os, tempfile, base64\nimport numpy as np\nimport matplotlib.pyplot as plt\nfrom datetime import datetime\nfrom scipy.signal import find_peaks\nimport mediapipe as mp\n\nfrom reportlab.platypus import (\n    SimpleDocTemplate, Paragraph, Image as PDFImage,\n    Spacer, Table, TableStyle, PageBreak\n)\nfrom reportlab.lib.styles import getSampleStyleSheet\nfrom reportlab.lib.pagesizes import A4\nfrom reportlab.lib.units import cm\nfrom reportlab.lib import colors\n\nimport streamlit.components.v1 as components\n\n# ==============================\n# CONFIG\n# ==============================\nst.set_page_config("GaitScan Pro (MediaPipe)", layout="wide")\nst.title("🏃 GaitScan Pro – Analyse Cinématique")\nFPS = 30\n\n# ==============================\n# MEDIAPIPE\n# ==============================\nmp_pose = mp.solutions.pose\n\n@st.cache_resource\ndef load_pose():\n    return mp_pose.Pose(\n        static_image_mode=False,\n        model_complexity=1,\n        smooth_landmarks=True,\n        min_detection_confidence=0.5,\n        min_tracking_confidence=0.5,\n    )\n\npose = load_pose()\n\n# ==============================\n# NORMES\n# ==============================\ndef norm_curve(joint, n):\n    x = np.linspace(0, 100, n)\n    if joint == "Genou":\n        return np.interp(x, [0, 15, 40, 60, 80, 100], [5, 15, 5, 40, 60, 5])\n    if joint == "Hanche":\n        return np.interp(x, [0, 30, 60, 100], [30, 0, -10, 30])\n    if joint == "Cheville":\n        return np.interp(x, [0, 10, 50, 70, 100], [5, 10, 25, 10, 5])\n    if joint == "Tronc":\n        return np.zeros(n)\n    return np.zeros(n)\n\ndef smooth_ma(y, win=7):\n    y = np.asarray(y, dtype=float)\n    if win is None or win <= 1:\n        return y\n    win = int(win)\n    if win % 2 == 0:\n        win += 1\n    pad = win // 2\n    ypad = np.pad(y, (pad, pad), mode="edge")\n    kernel = np.ones(win, dtype=float) / win\n    return np.convolve(ypad, kernel, mode="valid")\n\n# ==============================\n# OUTLIERS + LISSAGE CLINIQUE\n# ==============================\ndef interp_nan(arr):\n    arr = np.asarray(arr, dtype=float)\n    idx = np.arange(len(arr))\n    ok = ~np.isnan(arr)\n    if ok.sum() >= 2:\n        return np.interp(idx, idx[ok], arr[ok])\n    return np.zeros_like(arr)\n\ndef remove_outliers_hampel(x, win=5, n_sigmas=3.0):\n    x = np.asarray(x, dtype=float).copy()\n    n = len(x)\n    if n < 3:\n        return x\n\n    y = x.copy()\n    k = 1.4826\n\n    for i in range(n):\n        i0 = max(0, i - win)\n        i1 = min(n, i + win + 1)\n        w = x[i0:i1]\n        med = np.median(w)\n        mad = np.median(np.abs(w - med))\n\n        if mad < 1e-9:\n            continue\n\n        if abs(x[i] - med) > n_sigmas * k * mad:\n            y[i] = med\n\n    return y\n\ndef smooth_clinical(arr, smooth_level=3):\n    x = interp_nan(arr)\n    x = remove_outliers_hampel(x, win=3 + smooth_level, n_sigmas=3.0)\n    win = max(3, 2 * smooth_level + 3)\n    if win % 2 == 0:\n        win += 1\n    return smooth_ma(x, win=win)\n\n# ==============================\n# POSE DETECTION\n# ==============================\ndef detect_pose(frame):\n    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)\n    res = pose.process(img_rgb)\n    if not res.pose_landmarks:\n        return None\n\n    lm = res.pose_landmarks.landmark\n    L = mp_pose.PoseLandmark\n\n    def pt(l):\n        p = lm[int(l)]\n        return np.array([p.x, p.y], dtype=np.float32), float(p.visibility)\n\n    kp = {}\n    for side, suf in [("LEFT", "G"), ("RIGHT", "D")]:\n        kp[f"Epaule {suf}"], kp[f"Epaule {suf} vis"] = pt(getattr(L, f"{side}_SHOULDER"))\n        kp[f"Hanche {suf}"], kp[f"Hanche {suf} vis"] = pt(getattr(L, f"{side}_HIP"))\n        kp[f"Genou {suf}"], kp[f"Genou {suf} vis"] = pt(getattr(L, f"{side}_KNEE"))\n        kp[f"Cheville {suf}"], kp[f"Cheville {suf} vis"] = pt(getattr(L, f"{side}_ANKLE"))\n        kp[f"Talon {suf}"], kp[f"Talon {suf} vis"] = pt(getattr(L, f"{side}_HEEL"))\n        kp[f"Orteil {suf}"], kp[f"Orteil {suf} vis"] = pt(getattr(L, f"{side}_FOOT_INDEX"))\n    return kp\n\n# ==============================\n# ANGLES\n# ==============================\ndef angle(a, b, c):\n    ba = a - b\n    bc = c - b\n    ba[1] *= -1\n    bc[1] *= -1\n    cosv = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)\n    return float(np.degrees(np.arccos(np.clip(cosv, -1, 1))))\n\ndef angle_between(v1, v2):\n    v1 = np.asarray(v1, dtype=float).copy()\n    v2 = np.asarray(v2, dtype=float).copy()\n    v1[1] *= -1\n    v2[1] *= -1\n    cosv = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)\n    return float(np.degrees(np.arccos(np.clip(cosv, -1, 1))))\n\ndef angle_hanche(e, h, g):\n    return 180 - angle(e, h, g)\n\ndef angle_genou(h, g, c):\n    return 180 - angle(h, g, c)\n\ndef angle_cheville_brut(g, c, t, o):\n    jambe = g - c\n    pied = o - t\n    return angle_between(jambe, pied)\n\ndef angle_cheville(g, c, t, o):\n    return angle_cheville_brut(g, c, t, o) - 90.0\n\ndef midpoint(p1, p2):\n    return (np.asarray(p1, dtype=float) + np.asarray(p2, dtype=float)) / 2.0\n\ndef angle_tronc(epaule_g, epaule_d, hanche_g, hanche_d):\n    ep_mid = midpoint(epaule_g, epaule_d)\n    ha_mid = midpoint(hanche_g, hanche_d)\n    v = ep_mid - ha_mid\n    v[1] *= -1\n    return float(np.degrees(np.arctan2(v[0], v[1] + 1e-6)))\n\n# ==============================\n# CONTACTS SOL + CYCLE\n# ==============================\ndef detect_foot_contacts(y, fps=FPS):\n    y = np.asarray(y, dtype=float)\n\n    if np.isnan(y).any():\n        idx = np.arange(len(y))\n        ok = ~np.isnan(y)\n        if ok.sum() >= 2:\n            y = np.interp(idx, idx[ok], y[ok])\n        else:\n            return np.array([], dtype=int), y\n\n    y_s = smooth_clinical(y, smooth_level=2)\n\n    inv = -y_s\n    min_distance = max(1, int(0.35 * fps))\n    prominence = max(1e-6, np.std(inv) * 0.2)\n\n    peaks, _ = find_peaks(inv, distance=min_distance, prominence=prominence)\n    return peaks, y_s\n\ndef compute_step_times(contact_idx, fps=FPS):\n    contact_idx = np.asarray(contact_idx, dtype=int)\n    if len(contact_idx) < 2:\n        return [], None, None\n\n    step_times = np.diff(contact_idx) / float(fps)\n    return step_times.tolist(), float(np.mean(step_times)), float(np.std(step_times))\n\ndef detect_cycle(y):\n    contacts, _ = detect_foot_contacts(y, fps=FPS)\n    if len(contacts) < 2:\n        return None\n\n    mid = len(contacts) // 2\n    if mid == 0:\n        return int(contacts[0]), int(contacts[1])\n\n    return int(contacts[mid - 1]), int(contacts[mid])\n\n# ==============================\n# VIDEO PROCESS\n# ==============================\ndef process_video(path, conf):\n    cap = cv2.VideoCapture(path)\n    res = {k: [] for k in ["Tronc", "Hanche G", "Hanche D", "Genou G", "Genou D", "Cheville G", "Cheville D"]}\n\n    heelG_y, heelD_y = [], []\n    heelG_x, heelD_x = [], []\n    toeG_x, toeD_x = [], []\n\n    frames = []\n\n    while cap.isOpened():\n        r, f = cap.read()\n        if not r:\n            break\n        frames.append(f.copy())\n\n        kp = detect_pose(f)\n        if kp is None:\n            for k in res:\n                res[k].append(np.nan)\n            heelG_y.append(np.nan)\n            heelD_y.append(np.nan)\n            heelG_x.append(np.nan)\n            heelD_x.append(np.nan)\n            toeG_x.append(np.nan)\n            toeD_x.append(np.nan)\n            continue\n\n        def ok(n):\n            return kp.get(f"{n} vis", 0.0) >= conf\n\n        res["Tronc"].append(\n            angle_tronc(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"])\n            if (ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D")) else np.nan\n        )\n\n        res["Hanche G"].append(\n            angle_hanche(kp["Epaule G"], kp["Hanche G"], kp["Genou G"])\n            if (ok("Epaule G") and ok("Hanche G") and ok("Genou G")) else np.nan\n        )\n        res["Hanche D"].append(\n            angle_hanche(kp["Epaule D"], kp["Hanche D"], kp["Genou D"])\n            if (ok("Epaule D") and ok("Hanche D") and ok("Genou D")) else np.nan\n        )\n\n        res["Genou G"].append(\n            angle_genou(kp["Hanche G"], kp["Genou G"], kp["Cheville G"])\n            if (ok("Hanche G") and ok("Genou G") and ok("Cheville G")) else np.nan\n        )\n        res["Genou D"].append(\n            angle_genou(kp["Hanche D"], kp["Genou D"], kp["Cheville D"])\n            if (ok("Hanche D") and ok("Genou D") and ok("Cheville D")) else np.nan\n        )\n\n        res["Cheville G"].append(\n            angle_cheville(kp["Genou G"], kp["Cheville G"], kp["Talon G"], kp["Orteil G"])\n            if (ok("Genou G") and ok("Cheville G") and ok("Talon G") and ok("Orteil G")) else np.nan\n        )\n        res["Cheville D"].append(\n            angle_cheville(kp["Genou D"], kp["Cheville D"], kp["Talon D"], kp["Orteil D"])\n            if (ok("Genou D") and ok("Cheville D") and ok("Talon D") and ok("Orteil D")) else np.nan\n        )\n\n        heelG_y.append(float(kp["Talon G"][1]) if ok("Talon G") else np.nan)\n        heelD_y.append(float(kp["Talon D"][1]) if ok("Talon D") else np.nan)\n\n        heelG_x.append(float(kp["Talon G"][0]) if ok("Talon G") else np.nan)\n        heelD_x.append(float(kp["Talon D"][0]) if ok("Talon D") else np.nan)\n\n        toeG_x.append(float(kp["Orteil G"][0]) if ok("Orteil G") else np.nan)\n        toeD_x.append(float(kp["Orteil D"][0]) if ok("Orteil D") else np.nan)\n\n    cap.release()\n    return res, heelG_y, heelD_y, heelG_x, heelD_x, toeG_x, toeD_x, frames\n\n# ==============================\n# ANNOTATION IMAGES\n# ==============================\ndef draw_angle_on_frame(img_bgr, pA, pB, pC, ang_deg, color=(0, 255, 0)):\n    h, w = img_bgr.shape[:2]\n    A = (int(pA[0] * w), int(pA[1] * h))\n    B = (int(pB[0] * w), int(pB[1] * h))\n    C = (int(pC[0] * w), int(pC[1] * h))\n\n    line_th = 4\n    circle_r = 7\n    text_scale = 1.2\n    text_th = 3\n\n    cv2.line(img_bgr, A, B, color, line_th)\n    cv2.line(img_bgr, C, B, color, line_th)\n    cv2.circle(img_bgr, B, circle_r, (0, 0, 255), -1)\n\n    label = f"{int(round(ang_deg))} deg"\n    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_th)\n    tx, ty = B[0] + 10, B[1] - 10\n    cv2.rectangle(img_bgr, (tx - 4, ty - th - 6), (tx + tw + 6, ty + 6), (0, 0, 0), -1)\n    cv2.putText(img_bgr, label, (tx, ty),\n                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (255, 255, 255), text_th, cv2.LINE_AA)\n\ndef draw_ankle_angle_on_frame(img_bgr, knee, ankle, heel, toe, ang_deg, color=(0, 255, 0)):\n    h, w = img_bgr.shape[:2]\n\n    K = (int(knee[0] * w), int(knee[1] * h))\n    A = (int(ankle[0] * w), int(ankle[1] * h))\n    H = (int(heel[0] * w), int(heel[1] * h))\n    T = (int(toe[0] * w), int(toe[1] * h))\n\n    line_th = 4\n    circle_r = 7\n    text_scale = 1.2\n    text_th = 3\n\n    cv2.line(img_bgr, K, A, color, line_th)\n    cv2.line(img_bgr, H, T, color, line_th)\n    cv2.circle(img_bgr, A, circle_r, (0, 0, 255), -1)\n\n    label = f"{int(round(ang_deg))} deg"\n    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_th)\n    tx, ty = A[0] + 10, A[1] - 10\n    cv2.rectangle(img_bgr, (tx - 4, ty - th - 6), (tx + tw + 6, ty + 6), (0, 0, 0), -1)\n    cv2.putText(img_bgr, label, (tx, ty),\n                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (255, 255, 255), text_th, cv2.LINE_AA)\n\ndef draw_trunk_angle_on_frame(img_bgr, shoulder_mid, hip_mid, ang_deg, color=(255, 165, 0)):\n    h, w = img_bgr.shape[:2]\n\n    S = (int(shoulder_mid[0] * w), int(shoulder_mid[1] * h))\n    H = (int(hip_mid[0] * w), int(hip_mid[1] * h))\n\n    ref_len = int(0.18 * h)\n    V = (H[0], H[1] - ref_len)\n\n    line_th = 4\n    circle_r = 7\n    text_scale = 1.0\n    text_th = 3\n\n    cv2.line(img_bgr, H, S, color, line_th)\n    cv2.line(img_bgr, H, V, (200, 200, 200), 2)\n    cv2.circle(img_bgr, H, circle_r, (0, 0, 255), -1)\n\n    label = f"Tronc {ang_deg:+.1f} deg"\n    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_th)\n    tx, ty = H[0] + 10, H[1] + 30\n    cv2.rectangle(img_bgr, (tx - 4, ty - th - 6), (tx + tw + 6, ty + 6), (0, 0, 0), -1)\n    cv2.putText(img_bgr, label, (tx, ty),\n                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (255, 255, 255), text_th, cv2.LINE_AA)\n\ndef annotate_frame(frame_bgr, kp, conf=0.30):\n    if kp is None:\n        return frame_bgr\n\n    def ok(n):\n        return kp.get(f"{n} vis", 0.0) >= conf\n\n    out = frame_bgr.copy()\n\n    if ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D"):\n        shoulder_mid = midpoint(kp["Epaule G"], kp["Epaule D"])\n        hip_mid = midpoint(kp["Hanche G"], kp["Hanche D"])\n        draw_trunk_angle_on_frame(\n            out,\n            shoulder_mid,\n            hip_mid,\n            angle_tronc(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"])\n        )\n\n    if ok("Epaule G") and ok("Hanche G") and ok("Genou G"):\n        draw_angle_on_frame(out, kp["Epaule G"], kp["Hanche G"], kp["Genou G"],\n                            angle_hanche(kp["Epaule G"], kp["Hanche G"], kp["Genou G"]))\n    if ok("Epaule D") and ok("Hanche D") and ok("Genou D"):\n        draw_angle_on_frame(out, kp["Epaule D"], kp["Hanche D"], kp["Genou D"],\n                            angle_hanche(kp["Epaule D"], kp["Hanche D"], kp["Genou D"]))\n\n    if ok("Hanche G") and ok("Genou G") and ok("Cheville G"):\n        draw_angle_on_frame(out, kp["Hanche G"], kp["Genou G"], kp["Cheville G"],\n                            angle_genou(kp["Hanche G"], kp["Genou G"], kp["Cheville G"]))\n    if ok("Hanche D") and ok("Genou D") and ok("Cheville D"):\n        draw_angle_on_frame(out, kp["Hanche D"], kp["Genou D"], kp["Cheville D"],\n                            angle_genou(kp["Hanche D"], kp["Genou D"], kp["Cheville D"]))\n\n    if ok("Genou G") and ok("Cheville G") and ok("Talon G") and ok("Orteil G"):\n        draw_ankle_angle_on_frame(\n            out,\n            kp["Genou G"], kp["Cheville G"], kp["Talon G"], kp["Orteil G"],\n            angle_cheville_brut(kp["Genou G"], kp["Cheville G"], kp["Talon G"], kp["Orteil G"])\n        )\n    if ok("Genou D") and ok("Cheville D") and ok("Talon D") and ok("Orteil D"):\n        draw_ankle_angle_on_frame(\n            out,\n            kp["Genou D"], kp["Cheville D"], kp["Talon D"], kp["Orteil D"],\n            angle_cheville_brut(kp["Genou D"], kp["Cheville D"], kp["Talon D"], kp["Orteil D"])\n        )\n\n    return out\n\n# ==============================\n# STEP LENGTH + ASYMMETRY\n# ==============================\ndef nan_interp(x):\n    x = np.array(x, dtype=float)\n    idx = np.arange(len(x))\n    ok = ~np.isnan(x)\n    if ok.sum() >= 2:\n        return np.interp(idx, idx[ok], x[ok])\n    return None\n\ndef asym_percent(left, right):\n    if left is None or right is None:\n        return None\n    denom = (left + right) / 2.0\n    if abs(denom) < 1e-6:\n        return None\n    return 100.0 * abs(right - left) / abs(denom)\n\ndef compute_step_length_cm(heelG_y, heelD_y, heelG_x, heelD_x, toeG_x, toeD_x, taille_cm):\n    """\n    Longueur du pas estimée en 2D :\n    - pas gauche = distance horizontale entre talon gauche à l\'attaque\n      et avant-pied droit\n    - pas droit = distance horizontale entre talon droit à l\'attaque\n      et avant-pied gauche\n    """\n\n    contactsG, _ = detect_foot_contacts(heelG_y, fps=FPS)\n    contactsD, _ = detect_foot_contacts(heelD_y, fps=FPS)\n\n    hGx = nan_interp(heelG_x)\n    hDx = nan_interp(heelD_x)\n    tGx = nan_interp(toeG_x)\n    tDx = nan_interp(toeD_x)\n\n    if hGx is None or hDx is None or tGx is None or tDx is None:\n        return None, None, None, None, None\n\n    stepG_list = []\n    stepD_list = []\n\n    for i in contactsG:\n        if 0 <= i < len(hGx) and 0 <= i < len(tDx):\n            stepG_list.append(abs(hGx[i] - tDx[i]))\n\n    for i in contactsD:\n        if 0 <= i < len(hDx) and 0 <= i < len(tGx):\n            stepD_list.append(abs(hDx[i] - tGx[i]))\n\n    valid_norm = stepG_list + stepD_list\n    if len(valid_norm) == 0:\n        return None, None, None, None, None\n\n    scale = float(taille_cm) / 0.53\n\n    stepG_cm = float(np.mean(stepG_list) * scale) if len(stepG_list) > 0 else None\n    stepD_cm = float(np.mean(stepD_list) * scale) if len(stepD_list) > 0 else None\n\n    valid_cm = [v for v in [stepG_cm, stepD_cm] if v is not None]\n    step_mean_cm = float(np.mean(valid_cm))\n    step_std_cm = float(np.std(valid_cm))\n    step_asym = asym_percent(stepG_cm, stepD_cm)\n\n    return step_mean_cm, step_std_cm, stepG_cm, stepD_cm, step_asym\n\n# ==============================\n# PDF EXPORT\n# ==============================\ndef export_pdf(patient, keyframe_path, figures, table_data, annotated_images,\n               step_info=None, asym_table=None, temporal_info=None, contact_fig_path=None):\n    out_path = os.path.join(tempfile.gettempdir(), f"GaitScan_{patient[\'nom\']}_{patient[\'prenom\']}.pdf")\n\n    doc = SimpleDocTemplate(\n        out_path, pagesize=A4,\n        leftMargin=1.7 * cm, rightMargin=1.7 * cm,\n        topMargin=1.7 * cm, bottomMargin=1.7 * cm\n    )\n\n    styles = getSampleStyleSheet()\n    story = []\n\n    story.append(Paragraph("<b>GaitScan Pro – Analyse Cinématique</b>", styles["Title"]))\n    story.append(Spacer(1, 0.2 * cm))\n\n    story.append(Paragraph(\n        f"<b>Patient :</b> {patient[\'nom\']} {patient[\'prenom\']}<br/>"\n        f"<b>Date :</b> {datetime.now().strftime(\'%d/%m/%Y\')}<br/>"\n        f"<b>Angle de film :</b> {patient.get(\'camera\',\'N/A\')}<br/>"\n        f"<b>Affichage phases :</b> {patient.get(\'phase\',\'N/A\')}<br/>"\n        f"<b>Norme affichée :</b> {\'Oui\' if patient.get(\'show_norm\', True) else \'Non\'}<br/>"\n        f"<b>Taille :</b> {patient.get(\'taille_cm\',\'N/A\')} cm",\n        styles["Normal"]\n    ))\n    story.append(Spacer(1, 0.35 * cm))\n\n    if step_info is not None:\n        story.append(Paragraph("<b>Paramètres spatio-temporels (estimation)</b>", styles["Heading2"]))\n        story.append(Paragraph(\n            f"<b>Longueur de pas moyenne :</b> {step_info[\'mean\']:.1f} cm<br/>"\n            f"<b>Variabilité :</b> ± {step_info[\'std\']:.1f} cm<br/>"\n            + (f"<b>Pas G :</b> {step_info[\'G\']:.1f} cm &nbsp;&nbsp; <b>Pas D :</b> {step_info[\'D\']:.1f} cm<br/>"\n               if step_info.get("G") is not None and step_info.get("D") is not None else "")\n            + (f"<b>Asymétrie pas (G/D) :</b> {step_info[\'asym\']:.1f} %<br/>"\n               if step_info.get("asym") is not None else "")\n            + "<i>Mesure monocaméra 2D sans calibration métrique : valeurs estimées.</i>",\n            styles["Normal"]\n        ))\n        story.append(Spacer(1, 0.25 * cm))\n\n    if temporal_info is not None:\n        story.append(Paragraph("<b>Paramètres temporels</b>", styles["Heading2"]))\n        txt = ""\n\n        if temporal_info.get("G_mean") is not None:\n            txt += (\n                f"<b>Temps du pas Gauche :</b> {temporal_info[\'G_mean\']:.2f} s "\n                f"(± {temporal_info[\'G_std\']:.2f} s)<br/>"\n            )\n        else:\n            txt += "<b>Temps du pas Gauche :</b> non calculable<br/>"\n\n        if temporal_info.get("D_mean") is not None:\n            txt += (\n                f"<b>Temps du pas Droit :</b> {temporal_info[\'D_mean\']:.2f} s "\n                f"(± {temporal_info[\'D_std\']:.2f} s)<br/>"\n            )\n        else:\n            txt += "<b>Temps du pas Droit :</b> non calculable<br/>"\n\n        txt += (\n            f"<b>Contacts détectés :</b> Gauche = {temporal_info.get(\'nG\', 0)} "\n            f"&nbsp;&nbsp; Droit = {temporal_info.get(\'nD\', 0)}<br/>"\n            "<i>Les contacts au sol sont estimés à partir des minima verticaux des talons.</i>"\n        )\n\n        story.append(Paragraph(txt, styles["Normal"]))\n        story.append(Spacer(1, 0.25 * cm))\n\n    if contact_fig_path is not None and os.path.exists(contact_fig_path):\n        story.append(Paragraph("<b>Contacts au sol (talons)</b>", styles["Heading2"]))\n        story.append(PDFImage(contact_fig_path, width=16 * cm, height=6 * cm))\n        story.append(Spacer(1, 0.3 * cm))\n\n    if asym_table:\n        story.append(Paragraph("<b>Asymétries droite/gauche (angles)</b>", styles["Heading2"]))\n        t = Table([["Mesure", "Moy G", "Moy D", "Asym %"]] + asym_table,\n                  colWidths=[6 * cm, 3 * cm, 3 * cm, 3 * cm])\n        t.setStyle(TableStyle([\n            ("GRID", (0, 0), (-1, -1), 0.7, colors.black),\n            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),\n            ("ALIGN", (1, 1), (-1, -1), "CENTER")\n        ]))\n        story.append(t)\n        story.append(Spacer(1, 0.35 * cm))\n\n    story.append(Paragraph("<b>Image clé</b>", styles["Heading2"]))\n    story.append(PDFImage(keyframe_path, width=16 * cm, height=8 * cm))\n    story.append(Spacer(1, 0.4 * cm))\n\n    story.append(Paragraph("<b>Analyse articulaire</b>", styles["Heading2"]))\n    story.append(Spacer(1, 0.2 * cm))\n    for joint, figpath in figures.items():\n        story.append(Paragraph(f"<b>{joint}</b>", styles["Heading3"]))\n        story.append(PDFImage(figpath, width=16 * cm, height=6 * cm))\n        story.append(Spacer(1, 0.3 * cm))\n\n    story.append(Spacer(1, 0.2 * cm))\n    story.append(Paragraph("<b>Synthèse (°)</b>", styles["Heading2"]))\n\n    table = Table([["Mesure", "Min", "Moyenne", "Max"]] + table_data,\n                  colWidths=[7 * cm, 3 * cm, 3 * cm, 3 * cm])\n    table.setStyle(TableStyle([\n        ("GRID", (0, 0), (-1, -1), 0.7, colors.black),\n        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),\n        ("ALIGN", (1, 1), (-1, -1), "CENTER")\n    ]))\n    story.append(table)\n\n    if annotated_images:\n        story.append(PageBreak())\n        story.append(Paragraph("<b>Images annotées (angles)</b>", styles["Heading2"]))\n        story.append(Spacer(1, 0.2 * cm))\n        for img in annotated_images:\n            story.append(PDFImage(img, width=16 * cm, height=8 * cm))\n            story.append(Spacer(1, 0.25 * cm))\n\n    doc.build(story)\n    return out_path\n\n# ==============================\n# PDF VIEW + PRINT (browser-side)\n# ==============================\ndef pdf_viewer_with_print(pdf_bytes: bytes, height=800):\n    b64 = base64.b64encode(pdf_bytes).decode("utf-8")\n    html = f"""\n    <div style="display:flex; gap:12px; align-items:center; margin: 6px 0 10px 0;">\n      <button onclick="printPdf()" style="padding:10px 14px; font-size:16px; cursor:pointer;">\n        🖨️ Imprimer le rapport\n      </button>\n      <span style="opacity:0.7;">(ouvre la boîte d’impression du navigateur)</span>\n    </div>\n    <iframe id="pdfFrame" src="data:application/pdf;base64,{b64}" width="100%" height="{height}px" style="border:1px solid #ddd; border-radius:8px;"></iframe>\n    <script>\n      function printPdf() {{\n        const iframe = document.getElementById(\'pdfFrame\');\n        iframe.contentWindow.focus();\n        iframe.contentWindow.print();\n      }}\n    </script>\n    """\n    components.html(html, height=height + 80, scrolling=True)\n\n# ==============================\n# UI\n# ==============================\nwith st.sidebar:\n    nom = st.text_input("Nom", "DURAND")\n    prenom = st.text_input("Prénom", "Jean")\n    camera_pos = st.selectbox("Angle de film", ["Devant", "Droite", "Gauche"])\n    phase_cote = st.selectbox("Phases", ["Aucune", "Droite", "Gauche", "Les deux"])\n    smooth = st.slider("Lissage (patient)", 0, 10, 3)\n    conf = st.slider("Seuil confiance", 0.1, 0.9, 0.3, 0.05)\n\n    taille_cm = st.number_input("Taille du patient (cm)", min_value=80, max_value=230, value=170, step=1)\n\n    show_norm = st.checkbox("Afficher la norme", value=True)\n    norm_smooth_win = st.slider(\n        "Lissage norme (simple)", 1, 21, 7, 2,\n        help="Moyenne glissante (impair conseillé). 1 = pas de lissage."\n    )\n\nvideo = st.file_uploader("Vidéo", ["mp4", "avi", "mov"])\n\n# ==============================\n# ANALYSE\n# ==============================\nif video and st.button("▶ Lancer l\'analyse"):\n    tmp = tempfile.NamedTemporaryFile(delete=False)\n    tmp.write(video.read())\n    tmp.close()\n\n    data, heelG, heelD, heelG_x, heelD_x, toeG_x, toeD_x, frames = process_video(tmp.name, conf)\n    os.unlink(tmp.name)\n\n    contactsG, heelG_s = detect_foot_contacts(heelG, fps=FPS)\n    contactsD, heelD_s = detect_foot_contacts(heelD, fps=FPS)\n\n    step_times_G, step_time_G_mean, step_time_G_std = compute_step_times(contactsG, fps=FPS)\n    step_times_D, step_time_D_mean, step_time_D_std = compute_step_times(contactsD, fps=FPS)\n\n    phases = []\n    if phase_cote in ["Gauche", "Les deux"]:\n        c = detect_cycle(heelG)\n        if c:\n            phases.append((*c, "orange"))\n    if phase_cote in ["Droite", "Les deux"]:\n        c = detect_cycle(heelD)\n        if c:\n            phases.append((*c, "blue"))\n\n    step_mean, step_std, stepG_cm, stepD_cm, step_asym = compute_step_length_cm(\n        heelG, heelD, heelG_x, heelD_x, toeG_x, toeD_x, float(taille_cm)\n    )\n\n    st.subheader("📏 Paramètres spatio-temporels")\n    if step_mean is not None:\n        st.write(f"**Longueur de pas moyenne :** {step_mean:.1f} cm")\n        st.write(f"**Variabilité (±1σ) :** {step_std:.1f} cm")\n        if stepG_cm is not None and stepD_cm is not None:\n            st.write(f"**Pas G :** {stepG_cm:.1f} cm — **Pas D :** {stepD_cm:.1f} cm")\n        if step_asym is not None:\n            st.write(f"**Asymétrie pas (G/D) :** {step_asym:.1f} %")\n        st.caption("Estimation monocaméra 2D sans calibration métrique (échelle basée sur la taille).")\n    else:\n        st.warning("Longueur de pas non calculable.")\n\n    st.subheader("⏱️ Temps du pas")\n    col1, col2 = st.columns(2)\n\n    with col1:\n        if step_time_G_mean is not None:\n            st.write(f"**Temps du pas Gauche :** {step_time_G_mean:.2f} s")\n            st.write(f"**Variabilité Gauche :** ± {step_time_G_std:.2f} s")\n            st.write(f"**Nombre de contacts Gauche :** {len(contactsG)}")\n        else:\n            st.write("**Temps du pas Gauche :** non calculable")\n\n    with col2:\n        if step_time_D_mean is not None:\n            st.write(f"**Temps du pas Droit :** {step_time_D_mean:.2f} s")\n            st.write(f"**Variabilité Droit :** ± {step_time_D_std:.2f} s")\n            st.write(f"**Nombre de contacts Droit :** {len(contactsD)}")\n        else:\n            st.write("**Temps du pas Droit :** non calculable")\n\n    st.caption("Les contacts au sol sont estimés à partir des minima verticaux des talons.")\n\n    keyframe_path = os.path.join(tempfile.gettempdir(), "keyframe.png")\n    cv2.imwrite(keyframe_path, frames[len(frames) // 2])\n\n    figures = {}\n    table_data = []\n    asym_rows = []\n\n    # ----- TRONC (une seule courbe) -----\n    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})\n\n    trunk_raw = np.array(data["Tronc"], dtype=float)\n    trunk = smooth_clinical(trunk_raw, smooth_level=smooth)\n\n    ax1.plot(trunk, label="Tronc", color="darkorange")\n    for c0, c1, col in phases:\n        ax1.axvspan(c0, c1, color=col, alpha=0.3)\n    ax1.set_title("Tronc – Analyse")\n    ax1.legend()\n\n    if show_norm:\n        norm = norm_curve("Tronc", len(trunk))\n        norm = smooth_ma(norm, win=norm_smooth_win)\n        ax2.plot(norm, color="green")\n        ax2.set_title("Norme (lissée)" if norm_smooth_win and norm_smooth_win > 1 else "Norme")\n    else:\n        ax2.axis("off")\n\n    st.pyplot(fig)\n\n    fig_path = os.path.join(tempfile.gettempdir(), "Tronc_plot.png")\n    fig.savefig(fig_path, bbox_inches="tight")\n    plt.close(fig)\n    figures["Tronc"] = fig_path\n\n    mask = ~np.isnan(trunk_raw)\n    if mask.sum() == 0:\n        tmin, tmean, tmax = np.nan, np.nan, np.nan\n    else:\n        vals = trunk[mask]\n        tmin, tmean, tmax = float(np.min(vals)), float(np.mean(vals)), float(np.max(vals))\n\n    table_data.append(["Tronc", f"{tmin:.1f}", f"{tmean:.1f}", f"{tmax:.1f}"])\n\n    # ----- ARTICULATIONS droite/gauche -----\n    for joint in ["Hanche", "Genou", "Cheville"]:\n        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})\n\n        g_raw = np.array(data[f"{joint} G"], dtype=float)\n        d_raw = np.array(data[f"{joint} D"], dtype=float)\n\n        g = smooth_clinical(g_raw, smooth_level=smooth)\n        d = smooth_clinical(d_raw, smooth_level=smooth)\n\n        ax1.plot(g, label="Gauche", color="red")\n        ax1.plot(d, label="Droite", color="blue")\n        for c0, c1, col in phases:\n            ax1.axvspan(c0, c1, color=col, alpha=0.3)\n        ax1.set_title(f"{joint} – Analyse")\n        ax1.legend()\n\n        if show_norm:\n            norm = norm_curve(joint, len(g))\n            norm = smooth_ma(norm, win=norm_smooth_win)\n            ax2.plot(norm, color="green")\n            ax2.set_title("Norme (lissée)" if norm_smooth_win and norm_smooth_win > 1 else "Norme")\n        else:\n            ax2.axis("off")\n\n        st.pyplot(fig)\n\n        fig_path = os.path.join(tempfile.gettempdir(), f"{joint}_plot.png")\n        fig.savefig(fig_path, bbox_inches="tight")\n        plt.close(fig)\n        figures[joint] = fig_path\n\n        def stats(arr_filtered, arr_raw):\n            mask = ~np.isnan(arr_raw)\n            if mask.sum() == 0:\n                return np.nan, np.nan, np.nan, None\n            vals = arr_filtered[mask]\n            return float(np.min(vals)), float(np.mean(vals)), float(np.max(vals)), float(np.mean(vals))\n\n        gmin, gmean, gmax, gmean_only = stats(g, g_raw)\n        dmin, dmean, dmax, dmean_only = stats(d, d_raw)\n\n        table_data.append([f"{joint} Gauche", f"{gmin:.1f}", f"{gmean:.1f}", f"{gmax:.1f}"])\n        table_data.append([f"{joint} Droite", f"{dmin:.1f}", f"{dmean:.1f}", f"{dmax:.1f}"])\n\n        a = asym_percent(gmean_only, dmean_only)\n        if a is None:\n            asym_rows.append([\n                joint,\n                f"{gmean_only:.1f}" if gmean_only is not None else "NA",\n                f"{dmean_only:.1f}" if dmean_only is not None else "NA",\n                "NA"\n            ])\n        else:\n            asym_rows.append([joint, f"{gmean_only:.1f}", f"{dmean_only:.1f}", f"{a:.1f}"])\n\n    st.subheader("↔️ Asymétries droite/gauche (angles)")\n    for row in asym_rows:\n        st.write(f"**{row[0]}** — Moy G: {row[1]}° | Moy D: {row[2]}° | Asym: {row[3]}%")\n\n    st.subheader("🦶 Contacts au sol (talons)")\n    fig_contact, ax = plt.subplots(figsize=(12, 4))\n\n    x = np.arange(len(heelG_s)) / FPS\n    ax.plot(x, heelG_s, label="Talon Gauche", color="red")\n    ax.plot(x, heelD_s, label="Talon Droit", color="blue")\n\n    if len(contactsG) > 0:\n        ax.plot(contactsG / FPS, heelG_s[contactsG], "o", color="red")\n    for c in contactsG:\n        ax.axvline(c / FPS, color="red", alpha=0.15)\n\n    if len(contactsD) > 0:\n        ax.plot(contactsD / FPS, heelD_s[contactsD], "o", color="blue")\n    for c in contactsD:\n        ax.axvline(c / FPS, color="blue", alpha=0.15)\n\n    ax.set_title("Détection des contacts au sol")\n    ax.set_xlabel("Temps (s)")\n    ax.legend()\n    st.pyplot(fig_contact)\n\n    contact_fig_path = os.path.join(tempfile.gettempdir(), "contacts_sol.png")\n    fig_contact.savefig(contact_fig_path, bbox_inches="tight")\n    plt.close(fig_contact)\n\n    st.subheader("📸 Captures annotées (angles)")\n    num_photos = st.slider("Nombre d\'images extraites", 1, 10, 3)\n    total_frames = len(frames)\n    idxs = np.linspace(0, total_frames - 1, num_photos, dtype=int)\n\n    annotated_images = []\n    for i, idx in enumerate(idxs):\n        frame = frames[idx]\n        kp = detect_pose(frame)\n        ann = annotate_frame(frame, kp, conf=conf)\n\n        out_img = os.path.join(tempfile.gettempdir(), f"annotated_{i}.png")\n        cv2.imwrite(out_img, ann)\n        annotated_images.append(out_img)\n\n        st.image(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB), caption=f"Image annotée {i+1} (frame {idx})")\n\n    step_info = None\n    if step_mean is not None:\n        step_info = {"mean": step_mean, "std": step_std, "G": stepG_cm, "D": stepD_cm, "asym": step_asym}\n\n    temporal_info = {\n        "G_mean": step_time_G_mean,\n        "G_std": step_time_G_std,\n        "D_mean": step_time_D_mean,\n        "D_std": step_time_D_std,\n        "nG": len(contactsG),\n        "nD": len(contactsD),\n    }\n\n    pdf_path = export_pdf(\n        patient={\n            "nom": nom,\n            "prenom": prenom,\n            "camera": camera_pos,\n            "phase": phase_cote,\n            "taille_cm": int(taille_cm),\n            "show_norm": bool(show_norm)\n        },\n        keyframe_path=keyframe_path,\n        figures=figures,\n        table_data=table_data,\n        annotated_images=annotated_images,\n        step_info=step_info,\n        asym_table=asym_rows,\n        temporal_info=temporal_info,\n        contact_fig_path=contact_fig_path\n    )\n\n    with open(pdf_path, "rb") as f:\n        pdf_bytes = f.read()\n\n    st.success("✅ Rapport généré")\n    st.download_button(\n        "📄 Télécharger le rapport PDF",\n        data=pdf_bytes,\n        file_name=f"GaitScan_{nom}_{prenom}.pdf",\n        mime="application/pdf"\n    )\n\n\n=====================================\n\nimport streamlit as st\nst.set_page_config(page_title="Analyseur Postural Pro (MediaPipe)", layout="wide")\n\nimport os\nimport tempfile\nimport numpy as np\nimport cv2\nfrom PIL import Image\nimport math\nfrom fpdf import FPDF\nfrom datetime import datetime\nimport io\n\nimport mediapipe as mp\nfrom streamlit_image_coordinates import streamlit_image_coordinates\n\nst.title("🧍 Analyseur Postural Pro (MediaPipe)")\nst.markdown("---")\n\n# =========================\n# 1) MEDIAPIPE\n# =========================\nmp_pose = mp.solutions.pose\n\n@st.cache_resource\ndef load_pose():\n    return mp_pose.Pose(\n        static_image_mode=True,\n        model_complexity=1,\n        smooth_landmarks=True,\n        min_detection_confidence=0.5,\n        min_tracking_confidence=0.5,\n    )\n\npose = load_pose()\n\n# =========================\n# 2) OUTILS\n# =========================\ndef rotate_if_landscape(img_np_rgb: np.ndarray) -> np.ndarray:\n    if img_np_rgb.shape[1] > img_np_rgb.shape[0]:\n        img_np_rgb = cv2.rotate(img_np_rgb, cv2.ROTATE_90_CLOCKWISE)\n    return img_np_rgb\n\ndef ensure_uint8_rgb(img: np.ndarray) -> np.ndarray:\n    """Force image RGB uint8 contiguë."""\n    if img is None:\n        return None\n    if img.dtype != np.uint8:\n        img = img.astype(np.float32)\n        if img.max() <= 1.5:\n            img = img * 255.0\n        img = np.clip(img, 0, 255).astype(np.uint8)\n    if not img.flags["C_CONTIGUOUS"]:\n        img = np.ascontiguousarray(img)\n    return img\n\ndef to_png_bytes(img_rgb_uint8: np.ndarray) -> bytes:\n    """Encode en PNG bytes (ultra robuste)."""\n    img_rgb_uint8 = ensure_uint8_rgb(img_rgb_uint8)\n    pil = Image.fromarray(img_rgb_uint8, mode="RGB")\n    bio = io.BytesIO()\n    pil.save(bio, format="PNG")\n    return bio.getvalue()\n\ndef calculate_angle(p1, p2, p3) -> float:\n    v1 = np.array([p1[0]-p2[0], p1[1]-p2[1]], dtype=float)\n    v2 = np.array([p3[0]-p2[0], p3[1]-p2[1]], dtype=float)\n    dot = float(np.dot(v1, v2))\n    mag = float(np.linalg.norm(v1) * np.linalg.norm(v2))\n    if mag == 0:\n        return 0.0\n    return math.degrees(math.acos(np.clip(dot / mag, -1, 1)))\n\ndef femur_tibia_knee_angle(hip, knee, ankle) -> float:\n    return calculate_angle(hip, knee, ankle)\n\ndef tibia_rearfoot_ankle_angle(knee, ankle, heel) -> float:\n    return calculate_angle(knee, ankle, heel)\n\ndef pdf_safe(text) -> str:\n    if text is None:\n        return ""\n    s = str(text)\n    s = (s.replace("°", " deg")\n           .replace("–", "-")\n           .replace("—", "-")\n           .replace("’", "\'")\n           .replace("“", \'"\')\n           .replace("”", \'"\'))\n    return s.encode("latin-1", errors="ignore").decode("latin-1")\n\ndef crop_to_landmarks(img_rgb_uint8: np.ndarray, res_pose, pad_ratio: float = 0.18) -> np.ndarray:\n    """Cadrage auto autour du corps à partir des landmarks MediaPipe."""\n    if res_pose is None or not res_pose.pose_landmarks:\n        return img_rgb_uint8\n\n    h, w = img_rgb_uint8.shape[:2]\n    xs, ys = [], []\n    for lm in res_pose.pose_landmarks.landmark:\n        if lm.visibility < 0.2:\n            continue\n        xs.append(lm.x * w)\n        ys.append(lm.y * h)\n\n    if not xs or not ys:\n        return img_rgb_uint8\n\n    x1, x2 = max(0, int(min(xs))), min(w-1, int(max(xs)))\n    y1, y2 = max(0, int(min(ys))), min(h-1, int(max(ys)))\n\n    bw = max(1, x2 - x1)\n    bh = max(1, y2 - y1)\n    pad_x = int(bw * pad_ratio)\n    pad_y = int(bh * pad_ratio)\n\n    x1 = max(0, x1 - pad_x)\n    x2 = min(w-1, x2 + pad_x)\n    y1 = max(0, y1 - pad_y)\n    y2 = min(h-1, y2 + pad_y)\n\n    if x2 <= x1 or y2 <= y1:\n        return img_rgb_uint8\n\n    return img_rgb_uint8[y1:y2, x1:x2].copy()\n\ndef _to_float(val):\n    if val is None:\n        return None\n    s = str(val).replace(",", ".")\n    num = ""\n    for ch in s:\n        if ch.isdigit() or ch in ".-":\n            num += ch\n        elif num:\n            break\n    try:\n        return float(num)\n    except:\n        return None\n\ndef _badge(status: str):\n    if status == "OK":\n        return "🟢 OK"\n    if status == "SURV":\n        return "🟠 À surveiller"\n    return "🔴 À corriger"\n\ndef _status_from_mm(mm: float):\n    if mm is None:\n        return "SURV"\n    if mm < 5:\n        return "OK"\n    if mm < 10:\n        return "SURV"\n    return "ALERTE"\n\ndef _status_from_deg(deg: float):\n    if deg is None:\n        return "SURV"\n    if deg < 2:\n        return "OK"\n    if deg < 5:\n        return "SURV"\n    return "ALERTE"\n\n# =========================\n# PDF PRO (EN MÉMOIRE + COMPAT FPDF)\n# =========================\ndef generate_pdf(data: dict, img_rgb_uint8: np.ndarray) -> bytes:\n    from fpdf import FPDF\n    import os\n    import tempfile\n    from PIL import Image\n    from datetime import datetime\n\n    def _pdf_safe(text):\n        if text is None:\n            return ""\n        s = str(text)\n        s = (s.replace("°", " deg")\n               .replace("–", "-")\n               .replace("—", "-")\n               .replace("’", "\'")\n               .replace("“", \'"\')\n               .replace("”", \'"\')\n               .replace("\\xa0", " "))\n        return s.encode("latin-1", errors="ignore").decode("latin-1")\n\n    def _to_float(val):\n        try:\n            s = str(val).replace(",", ".")\n            num = ""\n            for ch in s:\n                if ch.isdigit() or ch in ".-":\n                    num += ch\n                elif num:\n                    break\n            return float(num)\n        except:\n            return None\n\n    def _status_mm(v):\n        if v is None:\n            return "A SURV"\n        if v < 5:\n            return "OK"\n        if v < 10:\n            return "A SURV"\n        return "ALERTE"\n\n    pdf = FPDF()\n    pdf.set_auto_page_break(auto=True, margin=15)\n    pdf.add_page()\n\n    # Bandeau\n    pdf.set_fill_color(31, 73, 125)\n    pdf.rect(0, 0, 210, 35, \'F\')\n    pdf.set_text_color(255, 255, 255)\n    pdf.set_font("Arial", \'B\', 20)\n    pdf.set_y(10)\n    pdf.cell(0, 10, "COMPTE-RENDU POSTURAL (IA)", align="C", ln=True)\n\n    # Infos patient\n    pdf.set_text_color(0, 0, 0)\n    pdf.set_y(42)\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.cell(120, 8, _pdf_safe(f"Patient : {data.get(\'Nom\',\'\')}"), ln=0)\n    pdf.set_font("Arial", \'\', 11)\n    pdf.cell(70, 8, datetime.now().strftime("%d/%m/%Y %H:%M"), ln=1, align="R")\n    pdf.ln(2)\n    pdf.line(10, pdf.get_y(), 200, pdf.get_y())\n    pdf.ln(4)\n\n    # ================= IMAGE (FIT DANS LA PAGE + PLUS PETITE + CENTRÉE) =================\n    tmp_img = os.path.join(tempfile.gettempdir(), "posture_tmp.png")\n    Image.fromarray(img_rgb_uint8).save(tmp_img)\n\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.cell(0, 7, "Photographie annotée", ln=True)\n\n    # Position actuelle et espace disponible\n    y = pdf.get_y()\n    page_w = pdf.w - 2 * pdf.l_margin\n    avail_h = pdf.h - pdf.b_margin - y\n\n    # Ratio image\n    ih, iw = img_rgb_uint8.shape[:2]\n    aspect = iw / ih  # largeur/hauteur\n\n    # Largeur cible "plus petite"\n    target_w = page_w * 0.62   # <-- diminue (0.5 / 0.45) si tu veux encore plus petit\n    target_h = target_w / aspect\n\n    # S\'assurer que ça rentre verticalement (sinon FPDF pousse sur page suivante => page blanche)\n    if target_h > avail_h:\n        target_h = avail_h\n        target_w = target_h * aspect\n\n    x = (pdf.w - target_w) / 2\n    pdf.image(tmp_img, x=x, y=y, w=target_w, h=target_h)\n    pdf.set_y(y + target_h + 4)\n\n    # Synthèse\n    sh_mm = _to_float(data.get("Dénivelé Épaules (mm)"))\n    hip_mm = _to_float(data.get("Dénivelé Bassin (mm)"))\n\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.cell(0, 7, "Synthèse", ln=True)\n    pdf.set_font("Arial", \'\', 11)\n    pdf.cell(0, 6, _pdf_safe(f"- Épaules : {data.get(\'Dénivelé Épaules (mm)\',\'—\')} [{_status_mm(sh_mm)}]"), ln=True)\n    pdf.cell(0, 6, _pdf_safe(f"- Bassin  : {data.get(\'Dénivelé Bassin (mm)\',\'—\')} [{_status_mm(hip_mm)}]"), ln=True)\n    pdf.ln(3)\n\n    # Tableau\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.set_fill_color(240, 240, 240)\n    pdf.cell(120, 9, "Indicateur", 1, 0, \'L\', True)\n    pdf.cell(70, 9, "Valeur", 1, 1, \'C\', True)\n\n    pdf.set_font("Arial", \'\', 11)\n    for k, v in data.items():\n        if k != "Nom":\n            pdf.cell(120, 8, _pdf_safe(k), 1, 0, \'L\')\n            pdf.cell(70, 8, _pdf_safe(v), 1, 1, \'C\')\n\n    # Observations\n    pdf.ln(4)\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.cell(0, 7, "Observations automatiques", ln=True)\n    pdf.set_font("Arial", \'\', 11)\n\n    obs = []\n    obs.append("Analyse générée automatiquement à partir d\'une image 2D.")\n    obs.append("Les mesures dépendent de la qualité de la prise de vue.")\n\n    for o in obs:\n        pdf.multi_cell(190, 6, _pdf_safe(f"- {o}"))\n\n    # Footer\n    pdf.set_y(-18)\n    pdf.set_font("Arial", \'I\', 8)\n    pdf.set_text_color(120, 120, 120)\n    pdf.cell(0, 10, "Document indicatif - Ne remplace pas un avis médical.", align="C")\n\n    if os.path.exists(tmp_img):\n        try:\n            os.remove(tmp_img)\n        except Exception:\n            pass\n\n    out = pdf.output(dest="S")\n    if isinstance(out, (bytes, bytearray)):\n        return bytes(out)\n    return out.encode("latin-1")\n\n# =========================\n# POINTS ORIGINE + PREVIEW\n# =========================\ndef extract_origin_points_from_mediapipe(img_rgb_uint8: np.ndarray):\n    res = pose.process(img_rgb_uint8)\n    if not res.pose_landmarks:\n        return {}\n    lm = res.pose_landmarks.landmark\n    L = mp_pose.PoseLandmark\n    h, w = img_rgb_uint8.shape[:2]\n\n    def pt_px(enum_):\n        p = lm[enum_.value]\n        return (float(p.x * w), float(p.y * h))\n\n    return {\n        "Genou G": pt_px(L.LEFT_KNEE),\n        "Genou D": pt_px(L.RIGHT_KNEE),\n        "Cheville G": pt_px(L.LEFT_ANKLE),\n        "Cheville D": pt_px(L.RIGHT_ANKLE),\n        "Talon G": pt_px(L.LEFT_HEEL),\n        "Talon D": pt_px(L.RIGHT_HEEL),\n\n        "Hanche G": pt_px(L.LEFT_HIP),\n        "Hanche D": pt_px(L.RIGHT_HIP),\n\n        "_Epaule G": pt_px(L.LEFT_SHOULDER),\n        "_Epaule D": pt_px(L.RIGHT_SHOULDER),\n    }\n\ndef draw_preview(img_disp_rgb_uint8: np.ndarray, origin_points: dict, override_one: dict, scale: float) -> np.ndarray:\n    out = img_disp_rgb_uint8.copy()\n    out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)\n\n    for name, p in origin_points.items():\n        if name.startswith("_"):\n            continue\n        x = int(p[0] * scale)\n        y = int(p[1] * scale)\n        cv2.circle(out_bgr, (x, y), 6, (0, 255, 0), -1)\n\n    for name, p in override_one.items():\n        x = int(p[0] * scale)\n        y = int(p[1] * scale)\n        cv2.circle(out_bgr, (x, y), 10, (255, 0, 255), 3)\n        cv2.line(out_bgr, (x - 12, y), (x + 12, y), (255, 0, 255), 2)\n        cv2.line(out_bgr, (x, y - 12), (x, y + 12), (255, 0, 255), 2)\n        cv2.putText(out_bgr, name, (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)\n\n    return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)\n\n# =========================\n# 3) SESSION STATE\n# =========================\nif "override_one" not in st.session_state:\n    st.session_state["override_one"] = {}  # {"Cheville G": (x,y)}\n\n# =========================\n# 4) UI\n# =========================\nwith st.sidebar:\n    st.header("👤 Dossier Patient")\n    nom = st.text_input("Nom complet", value="Anonyme")\n    taille_cm = st.number_input("Taille (cm)", min_value=100, max_value=220, value=170)\n\n    st.divider()\n    source = st.radio("Source de l\'image", ["📷 Caméra", "📁 Téléverser une photo"])\n\n    st.divider()\n    st.subheader("🖱️ Correction avant analyse")\n    enable_click_edit = st.checkbox("Activer correction par clic", value=True)\n\n    editable_points = ["Hanche G", "Hanche D", "Genou G", "Genou D", "Cheville G", "Cheville D", "Talon G", "Talon D"]\n    point_to_edit = st.selectbox("Point à corriger", editable_points, disabled=not enable_click_edit)\n\n    c1, c2 = st.columns(2)\n    with c1:\n        if st.button("↩️ Reset point", disabled=not enable_click_edit):\n            st.session_state["override_one"].pop(point_to_edit, None)\n    with c2:\n        if st.button("🧹 Reset tout", disabled=not enable_click_edit):\n            st.session_state["override_one"] = {}\n\n    st.divider()\n    st.subheader("🖼️ Affichage")\n    disp_w_user = st.slider("Largeur d\'affichage (px)", min_value=320, max_value=900, value=520, step=10)\n    auto_crop = st.checkbox("Cadrage automatique (autour du corps)", value=True)\n\ncol_input, col_result = st.columns([1, 1])\n\n# =========================\n# 5) INPUT IMAGE\n# =========================\nwith col_input:\n    if source == "📷 Caméra":\n        image_data = st.camera_input("Capturez la posture")\n    else:\n        image_data = st.file_uploader("Format JPG/PNG", type=["jpg", "png", "jpeg"])\n\nif not image_data:\n    st.stop()\n\nif isinstance(image_data, Image.Image):\n    img_np = np.array(image_data.convert("RGB"))\nelse:\n    img_np = np.array(Image.open(image_data).convert("RGB"))\n\nimg_np = rotate_if_landscape(img_np)\nimg_np = ensure_uint8_rgb(img_np)\n\n# Cadrage auto (optionnel) sans casser le reste\nres_for_crop = pose.process(img_np)\nif auto_crop:\n    img_np = crop_to_landmarks(img_np, res_for_crop, pad_ratio=0.18)\n    img_np = ensure_uint8_rgb(img_np)\n\nh, w = img_np.shape[:2]\n\n# =========================\n# 6) PREVIEW CLIQUABLE\n# =========================\nwith col_input:\n    st.subheader("📌 Cliquez pour placer le point sélectionné (avant analyse)")\n    st.caption("Verts = points d\'origine | Violet = point corrigé")\n\n    disp_w = min(int(disp_w_user), w)\n    scale = disp_w / w\n    disp_h = int(h * scale)\n\n    img_disp = cv2.resize(img_np, (disp_w, disp_h), interpolation=cv2.INTER_AREA)\n    img_disp = ensure_uint8_rgb(img_disp)\n\n    origin_points = extract_origin_points_from_mediapipe(img_np)\n    preview = draw_preview(img_disp, origin_points, st.session_state["override_one"], scale)\n\n    coords = streamlit_image_coordinates(\n        Image.open(io.BytesIO(to_png_bytes(preview))),\n        key="img_click",\n    )\n\n    if enable_click_edit and coords is not None:\n        cx = float(coords["x"])\n        cy = float(coords["y"])\n        x_orig = cx / scale\n        y_orig = cy / scale\n        st.session_state["override_one"][point_to_edit] = (x_orig, y_orig)\n        st.success(f"✅ {point_to_edit} placé à ({x_orig:.0f}, {y_orig:.0f}) px")\n\n    if st.session_state["override_one"]:\n        st.write("**Point(s) corrigé(s) enregistré(s) :**")\n        for k, (x, y) in st.session_state["override_one"].items():\n            st.write(f"- {k} → ({x:.0f}, {y:.0f})")\n\n# =========================\n# 7) ANALYSE\n# =========================\nwith col_result:\n    st.subheader("⚙️ Analyse")\n    run = st.button("▶ Lancer l\'analyse")\n\nif not run:\n    st.stop()\n\nwith st.spinner("Détection (MediaPipe) + calculs..."):\n    res = pose.process(img_np)\n    if not res.pose_landmarks:\n        st.error("Aucune pose détectée. Photo plus nette, en pied, bien centrée.")\n        st.stop()\n\n    lm = res.pose_landmarks.landmark\n    L = mp_pose.PoseLandmark\n\n    def pt(enum_):\n        p = lm[enum_.value]\n        return np.array([p.x * w, p.y * h], dtype=np.float32)\n\n    LS = pt(L.LEFT_SHOULDER)\n    RS = pt(L.RIGHT_SHOULDER)\n    LH = pt(L.LEFT_HIP)\n    RH = pt(L.RIGHT_HIP)\n    LK = pt(L.LEFT_KNEE)\n    RK = pt(L.RIGHT_KNEE)\n    LA = pt(L.LEFT_ANKLE)\n    RA = pt(L.RIGHT_ANKLE)\n    LHE = pt(L.LEFT_HEEL)\n    RHE = pt(L.RIGHT_HEEL)\n\n    POINTS = {\n        "Epaule G": LS, "Epaule D": RS,\n        "Hanche G": LH, "Hanche D": RH,\n        "Genou G": LK, "Genou D": RK,\n        "Cheville G": LA, "Cheville D": RA,\n        "Talon G": LHE, "Talon D": RHE,\n    }\n\n    for k, (x, y) in st.session_state["override_one"].items():\n        if k in POINTS:\n            POINTS[k] = np.array([x, y], dtype=np.float32)\n\n    LS = POINTS["Epaule G"]; RS = POINTS["Epaule D"]\n    LH = POINTS["Hanche G"]; RH = POINTS["Hanche D"]\n    LK = POINTS["Genou G"];  RK = POINTS["Genou D"]\n    LA = POINTS["Cheville G"]; RA = POINTS["Cheville D"]\n    LHE = POINTS["Talon G"]; RHE = POINTS["Talon D"]\n\n    raw_sh = math.degrees(math.atan2(LS[1]-RS[1], LS[0]-RS[0]))\n    shoulder_angle = abs(raw_sh)\n    if shoulder_angle > 90:\n        shoulder_angle = abs(shoulder_angle - 180)\n\n    raw_hip = math.degrees(math.atan2(LH[1]-RH[1], LH[0]-RH[0]))\n    hip_angle = abs(raw_hip)\n    if hip_angle > 90:\n        hip_angle = abs(hip_angle - 180)\n\n    knee_l = femur_tibia_knee_angle(LH, LK, LA)\n    knee_r = femur_tibia_knee_angle(RH, RK, RA)\n    ankle_l = tibia_rearfoot_ankle_angle(LK, LA, LHE)\n    ankle_r = tibia_rearfoot_ankle_angle(RK, RA, RHE)\n\n    px_height = max(LA[1], RA[1]) - min(LS[1], RS[1])\n    mm_per_px = (float(taille_cm) * 10.0) / px_height if px_height > 0 else 0.0\n    diff_shoulders_mm = abs(LS[1] - RS[1]) * mm_per_px\n    diff_hips_mm = abs(LH[1] - RH[1]) * mm_per_px\n\n    shoulder_lower = "Gauche" if LS[1] > RS[1] else "Droite"\n    hip_lower = "Gauche" if LH[1] > RH[1] else "Droite"\n\n    ann_bgr = cv2.cvtColor(img_np.copy(), cv2.COLOR_RGB2BGR)\n\n    for _, p in POINTS.items():\n        cv2.circle(ann_bgr, tuple(p.astype(int)), 7, (0, 255, 0), -1)\n\n    for name in list(st.session_state["override_one"].keys()):\n        if name in POINTS:\n            p = POINTS[name]\n            cv2.circle(ann_bgr, tuple(p.astype(int)), 14, (255, 0, 255), 3)\n            cv2.putText(ann_bgr, name, (int(p[0]) + 10, int(p[1]) - 10),\n                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)\n\n    cv2.line(ann_bgr, tuple(LS.astype(int)), tuple(RS.astype(int)), (255, 0, 0), 3)\n    cv2.line(ann_bgr, tuple(LH.astype(int)), tuple(RH.astype(int)), (255, 0, 0), 3)\n\n    annotated = cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB)\n    annotated = ensure_uint8_rgb(annotated)\n\n    results = {\n        "Nom": nom,\n        "Inclinaison Épaules (0=horizon)": f"{shoulder_angle:.1f}°",\n        "Épaule la plus basse": shoulder_lower,\n        "Dénivelé Épaules (mm)": f"{diff_shoulders_mm:.1f} mm",\n        "Inclinaison Bassin (0=horizon)": f"{hip_angle:.1f}°",\n        "Bassin le plus bas": hip_lower,\n        "Dénivelé Bassin (mm)": f"{diff_hips_mm:.1f} mm",\n        "Angle Genou Gauche (fémur-tibia)": f"{knee_l:.1f}°",\n        "Angle Genou Droit (fémur-tibia)": f"{knee_r:.1f}°",\n        "Angle Cheville G (tibia-arrière-pied)": f"{ankle_l:.1f}°",\n        "Angle Cheville D (tibia-arrière-pied)": f"{ankle_r:.1f}°",\n    }\n\n# =========================\n# 8) SORTIE (WEB + PDF)\n# =========================\nwith col_result:\n    st.subheader("🧾 Compte-rendu d\'analyse posturale")\n\n    sh_deg = _to_float(results.get("Inclinaison Épaules (0=horizon)"))\n    hip_deg = _to_float(results.get("Inclinaison Bassin (0=horizon)"))\n    sh_mm = _to_float(results.get("Dénivelé Épaules (mm)"))\n    hip_mm = _to_float(results.get("Dénivelé Bassin (mm)"))\n\n    st.markdown("### 🧑\u200d⚕️ Identité")\n    st.write(f"**Patient :** {nom}")\n    st.write(f"**Taille déclarée :** {taille_cm} cm")\n    st.write(f"**Date/heure :** {datetime.now().strftime(\'%d/%m/%Y %H:%M\')}")\n\n    st.markdown("---")\n    st.markdown("### 📌 Synthèse (mêmes données que le PDF)")\n\n    sh_status = _status_from_mm(sh_mm)\n    hip_status = _status_from_mm(hip_mm)\n    sh_deg_status = _status_from_deg(sh_deg)\n    hip_deg_status = _status_from_deg(hip_deg)\n\n    c1, c2, c3, c4 = st.columns(4)\n    with c1:\n        st.markdown("**Épaules (mm)**")\n        st.write(results.get("Dénivelé Épaules (mm)", "—"))\n        st.write(_badge(sh_status))\n    with c2:\n        st.markdown("**Épaules (°)**")\n        st.write(results.get("Inclinaison Épaules (0=horizon)", "—"))\n        st.write(_badge(sh_deg_status))\n    with c3:\n        st.markdown("**Bassin (mm)**")\n        st.write(results.get("Dénivelé Bassin (mm)", "—"))\n        st.write(_badge(hip_status))\n    with c4:\n        st.markdown("**Bassin (°)**")\n        st.write(results.get("Inclinaison Bassin (0=horizon)", "—"))\n        st.write(_badge(hip_deg_status))\n\n    st.markdown("### 🧩 Détails")\n    left, right = st.columns(2)\n\n    with left:\n        st.markdown("**Alignement frontal**")\n        st.write(f"- Inclinaison épaules : {results.get(\'Inclinaison Épaules (0=horizon)\', \'—\')}")\n        st.write(f"- Épaule la plus basse : {results.get(\'Épaule la plus basse\', \'—\')}")\n        st.write(f"- Dénivelé épaules : {results.get(\'Dénivelé Épaules (mm)\', \'—\')}")\n        st.write("")\n        st.write(f"- Inclinaison bassin : {results.get(\'Inclinaison Bassin (0=horizon)\', \'—\')}")\n        st.write(f"- Bassin le plus bas : {results.get(\'Bassin le plus bas\', \'—\')}")\n        st.write(f"- Dénivelé bassin : {results.get(\'Dénivelé Bassin (mm)\', \'—\')}")\n\n    with right:\n        st.markdown("**Membres inférieurs**")\n        st.write(f"- Genou G (fémur-tibia) : {results.get(\'Angle Genou Gauche (fémur-tibia)\', \'—\')}")\n        st.write(f"- Genou D (fémur-tibia) : {results.get(\'Angle Genou Droit (fémur-tibia)\', \'—\')}")\n        st.write("")\n        st.write(f"- Cheville G (tibia-arrière-pied) : {results.get(\'Angle Cheville G (tibia-arrière-pied)\', \'—\')}")\n        st.write(f"- Cheville D (tibia-arrière-pied) : {results.get(\'Angle Cheville D (tibia-arrière-pied)\', \'—\')}")\n\n    st.markdown("### ✅ Observations automatiques")\n    obs = []\n    if sh_status == "ALERTE" or sh_deg_status == "ALERTE":\n        obs.append("Épaules : asymétrie marquée (contrôle clinique recommandé).")\n    elif sh_status == "SURV" or sh_deg_status == "SURV":\n        obs.append("Épaules : légère asymétrie (à surveiller).")\n    else:\n        obs.append("Épaules : alignement satisfaisant.")\n\n    if hip_status == "ALERTE" or hip_deg_status == "ALERTE":\n        obs.append("Bassin : bascule marquée (contrôle clinique recommandé).")\n    elif hip_status == "SURV" or hip_deg_status == "SURV":\n        obs.append("Bassin : légère bascule (à surveiller).")\n    else:\n        obs.append("Bassin : alignement satisfaisant.")\n\n    for o in obs:\n        st.write(f"- {o}")\n\n    st.markdown("### 📝 Tableau des mesures (identique PDF)")\n    st.table(results)\n\n    st.markdown("### 🖼️ Image annotée")\n    st.image(\n        Image.fromarray(annotated, mode="RGB"),\n        caption="Points verts = utilisés | Violet = corrigé",\n        use_column_width=True\n    )\n\n    st.markdown("---")\n    st.subheader("📄 PDF")\n    pdf_bytes = generate_pdf(results, annotated)\n    pdf_name = f"Bilan_{pdf_safe(results.get(\'Nom\',\'Anonyme\')).replace(\' \', \'_\')}.pdf"\n    st.download_button(\n        label="📥 Télécharger le Bilan PDF",\n        data=pdf_bytes,\n        file_name=pdf_name,\n        mime="application/pdf",\n    )\n\n\n\n===========================\n\nimport io\nimport math\nimport os\nimport tempfile\nfrom datetime import datetime\n\nimport cv2\nimport mediapipe as mp\nimport numpy as np\nimport streamlit as st\nfrom fpdf import FPDF\nfrom PIL import Image\nfrom streamlit_image_coordinates import streamlit_image_coordinates\n\nst.set_page_config(page_title="Analyseur Postural Latéral", layout="wide")\nst.title("🧍 Analyseur Postural Latéral (MediaPipe)")\nst.markdown("Mesure sur **un seul côté visible** : jambe, cuisse, tronc et tête par rapport à la verticale.")\nst.markdown("---")\n\nmp_pose = mp.solutions.pose\n\n@st.cache_resource\ndef load_pose():\n    return mp_pose.Pose(\n        static_image_mode=True,\n        model_complexity=1,\n        smooth_landmarks=True,\n        min_detection_confidence=0.5,\n        min_tracking_confidence=0.5,\n    )\n\npose = load_pose()\n\n\ndef ensure_uint8_rgb(img: np.ndarray) -> np.ndarray:\n    if img is None:\n        return None\n    if img.dtype != np.uint8:\n        img = img.astype(np.float32)\n        if img.max() <= 1.5:\n            img = img * 255.0\n        img = np.clip(img, 0, 255).astype(np.uint8)\n    if not img.flags["C_CONTIGUOUS"]:\n        img = np.ascontiguousarray(img)\n    return img\n\n\ndef rotate_if_landscape(img_np_rgb: np.ndarray) -> np.ndarray:\n    if img_np_rgb.shape[1] > img_np_rgb.shape[0]:\n        img_np_rgb = cv2.rotate(img_np_rgb, cv2.ROTATE_90_CLOCKWISE)\n    return img_np_rgb\n\n\ndef to_png_bytes(img_rgb_uint8: np.ndarray) -> bytes:\n    pil = Image.fromarray(ensure_uint8_rgb(img_rgb_uint8), mode="RGB")\n    bio = io.BytesIO()\n    pil.save(bio, format="PNG")\n    return bio.getvalue()\n\n\ndef pdf_safe(text) -> str:\n    if text is None:\n        return ""\n    s = str(text)\n    s = (s.replace("°", " deg")\n           .replace("–", "-")\n           .replace("—", "-")\n           .replace("’", "\'")\n           .replace("“", \'"\')\n           .replace("”", \'"\'))\n    return s.encode("latin-1", errors="ignore").decode("latin-1")\n\n\ndef _to_float(val):\n    if val is None:\n        return None\n    s = str(val).replace(",", ".")\n    num = ""\n    for ch in s:\n        if ch.isdigit() or ch in ".-":\n            num += ch\n        elif num:\n            break\n    try:\n        return float(num)\n    except Exception:\n        return None\n\n\ndef _badge(status: str):\n    if status == "OK":\n        return "🟢 OK"\n    if status == "SURV":\n        return "🟠 À surveiller"\n    return "🔴 À corriger"\n\n\ndef _status_from_deg(deg: float):\n    if deg is None:\n        return "SURV"\n    if deg < 2:\n        return "OK"\n    if deg < 5:\n        return "SURV"\n    return "ALERTE"\n\n\ndef calculate_angle(p1, p2, p3) -> float:\n    v1 = np.array([p1[0] - p2[0], p1[1] - p2[1]], dtype=float)\n    v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]], dtype=float)\n    dot = float(np.dot(v1, v2))\n    mag = float(np.linalg.norm(v1) * np.linalg.norm(v2))\n    if mag == 0:\n        return 0.0\n    return math.degrees(math.acos(np.clip(dot / mag, -1, 1)))\n\n\ndef angle_segment_vs_vertical(p1, p2) -> float:\n    dx = float(p2[0] - p1[0])\n    dy = float(p2[1] - p1[1])\n    return math.degrees(math.atan2(abs(dx), abs(dy) + 1e-9))\n\n\ndef signed_angle_segment_vs_vertical(p1, p2) -> float:\n    dx = float(p2[0] - p1[0])\n    dy = float(p2[1] - p1[1])\n    return math.degrees(math.atan2(dx, abs(dy) + 1e-9))\n\n\ndef crop_to_landmarks(img_rgb_uint8: np.ndarray, res_pose, pad_ratio: float = 0.18) -> np.ndarray:\n    if res_pose is None or not res_pose.pose_landmarks:\n        return img_rgb_uint8\n    h, w = img_rgb_uint8.shape[:2]\n    xs, ys = [], []\n    for lm in res_pose.pose_landmarks.landmark:\n        if getattr(lm, "visibility", 1.0) < 0.2:\n            continue\n        xs.append(lm.x * w)\n        ys.append(lm.y * h)\n    if not xs or not ys:\n        return img_rgb_uint8\n    x1, x2 = max(0, int(min(xs))), min(w - 1, int(max(xs)))\n    y1, y2 = max(0, int(min(ys))), min(h - 1, int(max(ys)))\n    bw = max(1, x2 - x1)\n    bh = max(1, y2 - y1)\n    pad_x = int(bw * pad_ratio)\n    pad_y = int(bh * pad_ratio)\n    x1 = max(0, x1 - pad_x)\n    x2 = min(w - 1, x2 + pad_x)\n    y1 = max(0, y1 - pad_y)\n    y2 = min(h - 1, y2 + pad_y)\n    if x2 <= x1 or y2 <= y1:\n        return img_rgb_uint8\n    return img_rgb_uint8[y1:y2, x1:x2].copy()\n\n\ndef choose_visible_side(landmarks):\n    L = mp_pose.PoseLandmark\n    left_ids = [L.LEFT_SHOULDER, L.LEFT_HIP, L.LEFT_KNEE, L.LEFT_ANKLE, L.LEFT_HEEL, L.LEFT_EAR]\n    right_ids = [L.RIGHT_SHOULDER, L.RIGHT_HIP, L.RIGHT_KNEE, L.RIGHT_ANKLE, L.RIGHT_HEEL, L.RIGHT_EAR]\n\n    left_score = sum(float(getattr(landmarks[i.value], "visibility", 0.0)) for i in left_ids)\n    right_score = sum(float(getattr(landmarks[i.value], "visibility", 0.0)) for i in right_ids)\n    return "left" if left_score >= right_score else "right"\n\n\ndef extract_points(img_rgb_uint8: np.ndarray):\n    res = pose.process(img_rgb_uint8)\n    if not res.pose_landmarks:\n        return None, None\n    lm = res.pose_landmarks.landmark\n    side = choose_visible_side(lm)\n    h, w = img_rgb_uint8.shape[:2]\n    L = mp_pose.PoseLandmark\n\n    def pt(enum_):\n        p = lm[enum_.value]\n        return np.array([p.x * w, p.y * h], dtype=np.float32)\n\n    side_map = {\n        "left": {\n            "Epaule": pt(L.LEFT_SHOULDER),\n            "Hanche": pt(L.LEFT_HIP),\n            "Genou": pt(L.LEFT_KNEE),\n            "Cheville": pt(L.LEFT_ANKLE),\n            "Talon": pt(L.LEFT_HEEL),\n            "Oreille": pt(L.LEFT_EAR),\n        },\n        "right": {\n            "Epaule": pt(L.RIGHT_SHOULDER),\n            "Hanche": pt(L.RIGHT_HIP),\n            "Genou": pt(L.RIGHT_KNEE),\n            "Cheville": pt(L.RIGHT_ANKLE),\n            "Talon": pt(L.RIGHT_HEEL),\n            "Oreille": pt(L.RIGHT_EAR),\n        },\n    }\n    points = side_map[side]\n    points["Nez"] = pt(L.NOSE)\n    return side, points\n\n\ndef draw_preview(img_disp_rgb_uint8: np.ndarray, origin_points: dict, override_points: dict, scale: float) -> np.ndarray:\n    out_bgr = cv2.cvtColor(img_disp_rgb_uint8.copy(), cv2.COLOR_RGB2BGR)\n    for name, p in origin_points.items():\n        x = int(p[0] * scale)\n        y = int(p[1] * scale)\n        cv2.circle(out_bgr, (x, y), 6, (0, 255, 0), -1)\n        cv2.putText(out_bgr, name, (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)\n    for name, p in override_points.items():\n        x = int(p[0] * scale)\n        y = int(p[1] * scale)\n        cv2.circle(out_bgr, (x, y), 10, (255, 0, 255), 3)\n        cv2.line(out_bgr, (x - 12, y), (x + 12, y), (255, 0, 255), 2)\n        cv2.line(out_bgr, (x, y - 12), (x, y + 12), (255, 0, 255), 2)\n    return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)\n\n\ndef generate_pdf(data: dict, img_rgb_uint8: np.ndarray) -> bytes:\n    pdf = FPDF()\n    pdf.set_auto_page_break(auto=True, margin=15)\n    pdf.add_page()\n\n    pdf.set_fill_color(31, 73, 125)\n    pdf.rect(0, 0, 210, 35, \'F\')\n    pdf.set_text_color(255, 255, 255)\n    pdf.set_font("Arial", \'B\', 18)\n    pdf.set_y(10)\n    pdf.cell(0, 10, "COMPTE-RENDU POSTURAL LATERAL", align="C", ln=True)\n\n    pdf.set_text_color(0, 0, 0)\n    pdf.set_y(42)\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.cell(120, 8, pdf_safe(f"Patient : {data.get(\'Nom\', \'\')}"), ln=0)\n    pdf.set_font("Arial", \'\', 11)\n    pdf.cell(70, 8, datetime.now().strftime("%d/%m/%Y %H:%M"), ln=1, align="R")\n    pdf.ln(2)\n    pdf.line(10, pdf.get_y(), 200, pdf.get_y())\n    pdf.ln(4)\n\n    tmp_img = os.path.join(tempfile.gettempdir(), "posture_lateral_tmp.png")\n    Image.fromarray(img_rgb_uint8).save(tmp_img)\n\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.cell(0, 7, "Photographie annotée", ln=True)\n    y = pdf.get_y()\n    page_w = pdf.w - 2 * pdf.l_margin\n    avail_h = pdf.h - pdf.b_margin - y\n    ih, iw = img_rgb_uint8.shape[:2]\n    aspect = iw / ih\n    target_w = page_w * 0.62\n    target_h = target_w / aspect\n    if target_h > avail_h:\n        target_h = avail_h\n        target_w = target_h * aspect\n    x = (pdf.w - target_w) / 2\n    pdf.image(tmp_img, x=x, y=y, w=target_w, h=target_h)\n    pdf.set_y(y + target_h + 4)\n\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.cell(0, 7, "Synthèse", ln=True)\n    pdf.set_font("Arial", \'\', 11)\n    for key in [\n        "Côté détecté",\n        "Inclinaison Jambe / verticale",\n        "Inclinaison Cuisse / verticale",\n        "Inclinaison Tronc / verticale",\n        "Inclinaison Tête-Cou / verticale",\n    ]:\n        if key in data:\n            pdf.cell(0, 6, pdf_safe(f"- {key} : {data[key]}"), ln=True)\n\n    pdf.ln(3)\n    pdf.set_font("Arial", \'B\', 12)\n    pdf.set_fill_color(240, 240, 240)\n    pdf.cell(120, 9, "Indicateur", 1, 0, \'L\', True)\n    pdf.cell(70, 9, "Valeur", 1, 1, \'C\', True)\n    pdf.set_font("Arial", \'\', 11)\n    for k, v in data.items():\n        if k != "Nom":\n            pdf.cell(120, 8, pdf_safe(k), 1, 0, \'L\')\n            pdf.cell(70, 8, pdf_safe(v), 1, 1, \'C\')\n\n    pdf.set_y(-18)\n    pdf.set_font("Arial", \'I\', 8)\n    pdf.set_text_color(120, 120, 120)\n    pdf.cell(0, 10, "Document indicatif - Ne remplace pas un avis médical.", align="C")\n\n    try:\n        os.remove(tmp_img)\n    except Exception:\n        pass\n\n    out = pdf.output(dest="S")\n    if isinstance(out, (bytes, bytearray)):\n        return bytes(out)\n    return out.encode("latin-1")\n\n\nif "override_points" not in st.session_state:\n    st.session_state["override_points"] = {}\n\nwith st.sidebar:\n    st.header("👤 Dossier patient")\n    nom = st.text_input("Nom complet", value="Anonyme")\n    taille_cm = st.number_input("Taille (cm)", min_value=100, max_value=230, value=170)\n    source = st.radio("Source de l\'image", ["📷 Caméra", "📁 Téléverser une photo"])\n    st.divider()\n    st.subheader("🖱️ Correction avant analyse")\n    enable_click_edit = st.checkbox("Activer correction par clic", value=True)\n    point_to_edit = st.selectbox(\n        "Point à corriger",\n        ["Epaule", "Hanche", "Genou", "Cheville", "Talon", "Oreille", "Nez"],\n        disabled=not enable_click_edit,\n    )\n    c1, c2 = st.columns(2)\n    with c1:\n        if st.button("↩️ Reset point", disabled=not enable_click_edit):\n            st.session_state["override_points"].pop(point_to_edit, None)\n    with c2:\n        if st.button("🧹 Reset tout", disabled=not enable_click_edit):\n            st.session_state["override_points"] = {}\n    st.divider()\n    disp_w_user = st.slider("Largeur d\'affichage (px)", 320, 900, 520, 10)\n    auto_crop = st.checkbox("Cadrage automatique", value=True)\n\ncol_input, col_result = st.columns([1, 1])\n\nwith col_input:\n    if source == "📷 Caméra":\n        image_data = st.camera_input("Capturez la posture latérale")\n    else:\n        image_data = st.file_uploader("Format JPG/PNG", type=["jpg", "jpeg", "png"])\n\nif not image_data:\n    st.stop()\n\nif isinstance(image_data, Image.Image):\n    img_np = np.array(image_data.convert("RGB"))\nelse:\n    img_np = np.array(Image.open(image_data).convert("RGB"))\n\nimg_np = ensure_uint8_rgb(rotate_if_landscape(img_np))\nres_for_crop = pose.process(img_np)\nif auto_crop:\n    img_np = ensure_uint8_rgb(crop_to_landmarks(img_np, res_for_crop, pad_ratio=0.18))\n\nh, w = img_np.shape[:2]\nside_detected, origin_points = extract_points(img_np)\nif origin_points is None:\n    st.error("Aucune pose détectée. Utilisez une photo nette, de profil, en pied.")\n    st.stop()\n\nwith col_input:\n    st.subheader("📌 Cliquez pour corriger le point sélectionné")\n    st.caption(f"Côté détecté automatiquement : **{\'Gauche\' if side_detected == \'left\' else \'Droite\'}**")\n    disp_w = min(int(disp_w_user), w)\n    scale = disp_w / w\n    disp_h = int(h * scale)\n    img_disp = cv2.resize(img_np, (disp_w, disp_h), interpolation=cv2.INTER_AREA)\n    preview = draw_preview(img_disp, origin_points, st.session_state["override_points"], scale)\n    coords = streamlit_image_coordinates(Image.open(io.BytesIO(to_png_bytes(preview))), key="img_click")\n    if enable_click_edit and coords is not None:\n        x_orig = float(coords["x"]) / scale\n        y_orig = float(coords["y"]) / scale\n        st.session_state["override_points"][point_to_edit] = (x_orig, y_orig)\n        st.success(f"✅ {point_to_edit} placé à ({x_orig:.0f}, {y_orig:.0f}) px")\n    if st.session_state["override_points"]:\n        st.write("**Point(s) corrigé(s) :**")\n        for k, (x, y) in st.session_state["override_points"].items():\n            st.write(f"- {k} → ({x:.0f}, {y:.0f})")\n\nwith col_result:\n    st.subheader("⚙️ Analyse")\n    run = st.button("▶ Lancer l\'analyse")\n\nif not run:\n    st.stop()\n\npoints = {k: v.copy() for k, v in origin_points.items()}\nfor k, v in st.session_state["override_points"].items():\n    if k in points:\n        points[k] = np.array([v[0], v[1]], dtype=np.float32)\n\nEpaule = points["Epaule"]\nHanche = points["Hanche"]\nGenou = points["Genou"]\nCheville = points["Cheville"]\nTalon = points["Talon"]\nOreille = points["Oreille"]\nNez = points["Nez"]\n\nincl_jambe = angle_segment_vs_vertical(Genou, Cheville)\nincl_cuisse = angle_segment_vs_vertical(Hanche, Genou)\nincl_tronc = angle_segment_vs_vertical(Hanche, Epaule)\nincl_tete_cou = angle_segment_vs_vertical(Epaule, Oreille)\nincl_tete_nez = angle_segment_vs_vertical(Oreille, Nez)\n\nsigned_tronc = signed_angle_segment_vs_vertical(Hanche, Epaule)\nsigned_tete = signed_angle_segment_vs_vertical(Epaule, Oreille)\nangle_genou = calculate_angle(Hanche, Genou, Cheville)\nangle_cheville = calculate_angle(Genou, Cheville, Talon)\n\nsens_tronc = "Vers l\'avant" if signed_tronc > 0 else "Vers l\'arrière"\nsens_tete = "Vers l\'avant" if signed_tete > 0 else "Vers l\'arrière"\n\nresults = {\n    "Nom": nom,\n    "Plan": "Latéral",\n    "Côté détecté": "Gauche" if side_detected == "left" else "Droite",\n    "Inclinaison Jambe / verticale": f"{incl_jambe:.1f}°",\n    "Inclinaison Cuisse / verticale": f"{incl_cuisse:.1f}°",\n    "Inclinaison Tronc / verticale": f"{incl_tronc:.1f}°",\n    "Sens inclinaison tronc": sens_tronc,\n    "Inclinaison Tête-Cou / verticale": f"{incl_tete_cou:.1f}°",\n    "Sens inclinaison tête": sens_tete,\n    "Inclinaison Tête (oreille-nez)": f"{incl_tete_nez:.1f}°",\n    "Angle Genou": f"{angle_genou:.1f}°",\n    "Angle Cheville": f"{angle_cheville:.1f}°",\n}\n\nann_bgr = cv2.cvtColor(img_np.copy(), cv2.COLOR_RGB2BGR)\nfor _, p in points.items():\n    cv2.circle(ann_bgr, tuple(np.round(p).astype(int)), 7, (0, 255, 0), -1)\nfor name, p in st.session_state["override_points"].items():\n    arr = np.array(p)\n    cv2.circle(ann_bgr, tuple(np.round(arr).astype(int)), 14, (255, 0, 255), 3)\n    cv2.putText(ann_bgr, name, (int(arr[0]) + 8, int(arr[1]) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)\ncv2.line(ann_bgr, tuple(np.round(Hanche).astype(int)), tuple(np.round(Epaule).astype(int)), (255, 0, 0), 3)\ncv2.line(ann_bgr, tuple(np.round(Hanche).astype(int)), tuple(np.round(Genou).astype(int)), (0, 200, 0), 3)\ncv2.line(ann_bgr, tuple(np.round(Genou).astype(int)), tuple(np.round(Cheville).astype(int)), (0, 255, 255), 3)\ncv2.line(ann_bgr, tuple(np.round(Epaule).astype(int)), tuple(np.round(Oreille).astype(int)), (255, 0, 255), 3)\ncv2.line(ann_bgr, tuple(np.round(Oreille).astype(int)), tuple(np.round(Nez).astype(int)), (100, 255, 100), 2)\nannotated = cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB)\nannotated = ensure_uint8_rgb(annotated)\n\nwith col_result:\n    st.subheader("🧾 Compte-rendu d\'analyse posturale")\n    st.markdown("### 🧑\u200d⚕️ Identité")\n    st.write(f"**Patient :** {nom}")\n    st.write(f"**Taille déclarée :** {taille_cm} cm")\n    st.write(f"**Date/heure :** {datetime.now().strftime(\'%d/%m/%Y %H:%M\')}")\n    st.write(f"**Côté détecté :** {results[\'Côté détecté\']}")\n    st.markdown("---")\n\n    leg_deg = _to_float(results.get("Inclinaison Jambe / verticale"))\n    thigh_deg = _to_float(results.get("Inclinaison Cuisse / verticale"))\n    trunk_deg = _to_float(results.get("Inclinaison Tronc / verticale"))\n    head_deg = _to_float(results.get("Inclinaison Tête-Cou / verticale"))\n\n    st.markdown("### 📌 Synthèse latérale")\n    c1, c2, c3, c4 = st.columns(4)\n    with c1:\n        st.markdown("**Jambe / verticale**")\n        st.write(results["Inclinaison Jambe / verticale"])\n        st.write(_badge(_status_from_deg(leg_deg)))\n    with c2:\n        st.markdown("**Cuisse / verticale**")\n        st.write(results["Inclinaison Cuisse / verticale"])\n        st.write(_badge(_status_from_deg(thigh_deg)))\n    with c3:\n        st.markdown("**Tronc / verticale**")\n        st.write(results["Inclinaison Tronc / verticale"])\n        st.write(_badge(_status_from_deg(trunk_deg)))\n    with c4:\n        st.markdown("**Tête / verticale**")\n        st.write(results["Inclinaison Tête-Cou / verticale"])\n        st.write(_badge(_status_from_deg(head_deg)))\n\n    st.markdown("### 🧩 Détails")\n    for key in [\n        "Inclinaison Jambe / verticale",\n        "Inclinaison Cuisse / verticale",\n        "Inclinaison Tronc / verticale",\n        "Sens inclinaison tronc",\n        "Inclinaison Tête-Cou / verticale",\n        "Sens inclinaison tête",\n        "Inclinaison Tête (oreille-nez)",\n        "Angle Genou",\n        "Angle Cheville",\n    ]:\n        st.write(f"- {key} : {results[key]}")\n\n    st.markdown("### ✅ Observations automatiques")\n    obs = []\n    if trunk_deg is not None:\n        obs.append("Tronc : alignement satisfaisant." if trunk_deg < 2 else "Tronc : légère inclinaison sagittale." if trunk_deg < 5 else "Tronc : inclinaison marquée.")\n    if head_deg is not None:\n        obs.append("Tête/cou : alignement satisfaisant." if head_deg < 2 else "Tête/cou : légère projection ou inclinaison." if head_deg < 5 else "Tête/cou : désalignement marqué.")\n    if leg_deg is not None:\n        obs.append("Jambe : orientation proche de la verticale." if leg_deg < 2 else "Jambe : légère inclinaison sagittale." if leg_deg < 5 else "Jambe : inclinaison marquée.")\n    for o in obs:\n        st.write(f"- {o}")\n\n    st.markdown("### 📝 Tableau des mesures")\n    st.table(results)\n\n    st.markdown("### 🖼️ Image annotée")\n    st.image(annotated, caption="Points verts = utilisés | Violet = corrigé", use_column_width=True)\n\n    st.markdown("---")\n    st.subheader("📄 PDF")\n    pdf_bytes = generate_pdf(results, annotated)\n    pdf_name = f"Bilan_Lateral_{pdf_safe(results.get(\'Nom\', \'Anonyme\')).replace(\' \', \'_\')}.pdf"\n    st.download_button(\n        label="📥 Télécharger le Bilan PDF",\n        data=pdf_bytes,\n        file_name=pdf_name,\n        mime="application/pdf",\n    )'
+FRONTALE_CODE = r"""
+import streamlit as st
+import cv2, os, tempfile, base64
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy.signal import find_peaks
+import mediapipe as mp
+
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Image as PDFImage,
+    Spacer, Table, TableStyle, PageBreak
+)
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+
+import streamlit.components.v1 as components
+
+# ==============================
+# CONFIG
+# ==============================
+st.set_page_config("GaitScan Pro (Analyse frontale)", layout="wide")
+st.title("🏃 GaitScan Pro – Analyse Frontale / Vue arrière")
+FPS = 30
+
+# ==============================
+# MEDIAPIPE
+# ==============================
+mp_pose = mp.solutions.pose
+
+@st.cache_resource
+def load_pose():
+    return mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        smooth_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+pose = load_pose()
+
+# ==============================
+# NORMES INDICATIVES
+# ==============================
+def norm_curve(metric, n):
+    x = np.linspace(0, 100, n)
+
+    if metric in ["Genou G", "Genou D"]:
+        return np.interp(x, [0, 25, 50, 75, 100], [1, 4, 0, -4, 1])
+
+    if metric in ["Arriere-pied G", "Arriere-pied D"]:
+        return np.interp(x, [0, 25, 50, 75, 100], [0.5, 2, 0, -2, 0.5])
+
+    if metric == "Bassin":
+        return np.interp(x, [0, 25, 50, 75, 100], [0, 2, 0, -2, 0])
+
+    if metric == "Tronc":
+        return np.interp(x, [0, 25, 50, 75, 100], [0, 2, 0, -2, 0])
+
+    return np.zeros(n)
+
+def smooth_ma(y, win=7):
+    y = np.asarray(y, dtype=float)
+    if win is None or win <= 1:
+        return y
+    win = int(win)
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    ypad = np.pad(y, (pad, pad), mode="edge")
+    kernel = np.ones(win, dtype=float) / win
+    return np.convolve(ypad, kernel, mode="valid")
+
+# ==============================
+# OUTLIERS + LISSAGE
+# ==============================
+def interp_nan(arr):
+    arr = np.asarray(arr, dtype=float)
+    idx = np.arange(len(arr))
+    ok = ~np.isnan(arr)
+    if ok.sum() >= 2:
+        return np.interp(idx, idx[ok], arr[ok])
+    return np.zeros_like(arr)
+
+def remove_outliers_hampel(x, win=5, n_sigmas=3.0):
+    x = np.asarray(x, dtype=float).copy()
+    n = len(x)
+    if n < 3:
+        return x
+
+    y = x.copy()
+    k = 1.4826
+
+    for i in range(n):
+        i0 = max(0, i - win)
+        i1 = min(n, i + win + 1)
+        w = x[i0:i1]
+        med = np.median(w)
+        mad = np.median(np.abs(w - med))
+
+        if mad < 1e-9:
+            continue
+
+        if abs(x[i] - med) > n_sigmas * k * mad:
+            y[i] = med
+
+    return y
+
+def smooth_clinical(arr, smooth_level=3):
+    x = interp_nan(arr)
+    x = remove_outliers_hampel(x, win=3 + smooth_level, n_sigmas=3.0)
+    win = max(3, 2 * smooth_level + 3)
+    if win % 2 == 0:
+        win += 1
+    return smooth_ma(x, win=win)
+
+# ==============================
+# POSE DETECTION
+# ==============================
+def detect_pose(frame):
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = pose.process(img_rgb)
+    if not res.pose_landmarks:
+        return None
+
+    lm = res.pose_landmarks.landmark
+    L = mp_pose.PoseLandmark
+
+    def pt(l):
+        p = lm[int(l)]
+        return np.array([p.x, p.y], dtype=np.float32), float(p.visibility)
+
+    kp = {}
+    for side, suf in [("LEFT", "G"), ("RIGHT", "D")]:
+        kp[f"Epaule {suf}"], kp[f"Epaule {suf} vis"] = pt(getattr(L, f"{side}_SHOULDER"))
+        kp[f"Hanche {suf}"], kp[f"Hanche {suf} vis"] = pt(getattr(L, f"{side}_HIP"))
+        kp[f"Genou {suf}"], kp[f"Genou {suf} vis"] = pt(getattr(L, f"{side}_KNEE"))
+        kp[f"Cheville {suf}"], kp[f"Cheville {suf} vis"] = pt(getattr(L, f"{side}_ANKLE"))
+        kp[f"Talon {suf}"], kp[f"Talon {suf} vis"] = pt(getattr(L, f"{side}_HEEL"))
+        kp[f"Orteil {suf}"], kp[f"Orteil {suf} vis"] = pt(getattr(L, f"{side}_FOOT_INDEX"))
+    return kp
+
+# ==============================
+# ANGLES FRONTAUX
+# ==============================
+def angle_3pts(a, b, c):
+    """
+    Angle géométrique (0-180°) au point b entre les segments b->a et b->c.
+    """
+    ba = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
+    bc = np.asarray(c, dtype=float) - np.asarray(b, dtype=float)
+
+    # repère image -> repère math
+    ba[1] *= -1
+    bc[1] *= -1
+
+    denom = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-9
+    cosv = np.dot(ba, bc) / denom
+    cosv = np.clip(cosv, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosv)))
+
+def signed_angle_vs_vertical(p1, p2):
+    """
+    Angle signé du segment p1->p2 par rapport à la verticale.
+    """
+    v = np.asarray(p2, dtype=float) - np.asarray(p1, dtype=float)
+    vx = v[0]
+    vy = -(v[1])
+    return float(np.degrees(np.arctan2(vx, vy + 1e-9)))
+
+def signed_angle_vs_horizontal(p1, p2):
+    """
+    Angle signé du segment p1->p2 par rapport à l'horizontale.
+    """
+    v = np.asarray(p2, dtype=float) - np.asarray(p1, dtype=float)
+    vx = v[0]
+    vy = -(v[1])
+    return float(np.degrees(np.arctan2(vy, vx + 1e-9)))
+
+def angle_genou_frontal(hip, knee, ankle, side=None):
+    """
+    Déviation frontale du genou = angle cuisse/jambe.
+    0° ~ alignement neutre.
+    """
+    raw = angle_3pts(hip, knee, ankle)   # proche de 180 si aligné
+    dev = 180.0 - raw                    # proche de 0 si aligné
+
+    hip = np.asarray(hip, dtype=float)
+    knee = np.asarray(knee, dtype=float)
+    ankle = np.asarray(ankle, dtype=float)
+
+    # Signe basé sur la position du genou par rapport à la ligne hanche-cheville
+    v1 = knee - hip
+    v2 = ankle - hip
+    cross = v1[0] * v2[1] - v1[1] * v2[0]
+
+    if side == "G":
+        sign = -1.0 if cross > 0 else 1.0
+    elif side == "D":
+        sign = 1.0 if cross > 0 else -1.0
+    else:
+        sign = 1.0 if cross > 0 else -1.0
+
+    return float(sign * abs(dev))
+
+def angle_arriere_pied_frontal(ankle, heel, side=None):
+    """
+    Déviation frontale stable de l'arrière-pied par rapport à la verticale.
+    On utilise le segment talon -> cheville, avec formule stable
+    pour éviter les sauts absurdes de type atan2 sur quadrant.
+    """
+    ankle = np.asarray(ankle, dtype=float)
+    heel = np.asarray(heel, dtype=float)
+
+    # segment talon -> cheville
+    v = ankle - heel
+    dx = v[0]
+    dy = v[1]
+
+    # déviation par rapport à la verticale, version stable
+    ang = np.degrees(np.arctan2(dx, abs(dy) + 1e-9))
+
+    # harmonisation visuelle G/D
+    if side == "G":
+        ang = -ang
+
+    return float(ang)
+
+def angle_bassin_frontal(hipL, hipR):
+    """
+    Obliquité pelvienne.
+    """
+    return signed_angle_vs_horizontal(hipL, hipR)
+
+def angle_tronc_frontal(shL, shR, hipL, hipR):
+    """
+    Inclinaison latérale du tronc.
+    """
+    mid_sh = (np.asarray(shL) + np.asarray(shR)) / 2.0
+    mid_hip = (np.asarray(hipL) + np.asarray(hipR)) / 2.0
+    return signed_angle_vs_vertical(mid_hip, mid_sh)
+
+# ==============================
+# CONTACTS SOL + CYCLE
+# ==============================
+def detect_foot_contacts(y, fps=FPS):
+    y = np.asarray(y, dtype=float)
+
+    if np.isnan(y).any():
+        idx = np.arange(len(y))
+        ok = ~np.isnan(y)
+        if ok.sum() >= 2:
+            y = np.interp(idx, idx[ok], y[ok])
+        else:
+            return np.array([], dtype=int), y
+
+    y_s = smooth_clinical(y, smooth_level=2)
+
+    inv = -y_s
+    min_distance = max(1, int(0.35 * fps))
+    prominence = max(1e-6, np.std(inv) * 0.2)
+
+    peaks, _ = find_peaks(inv, distance=min_distance, prominence=prominence)
+    return peaks, y_s
+
+def compute_step_times(contact_idx, fps=FPS):
+    contact_idx = np.asarray(contact_idx, dtype=int)
+    if len(contact_idx) < 2:
+        return [], None, None
+
+    step_times = np.diff(contact_idx) / float(fps)
+    return step_times.tolist(), float(np.mean(step_times)), float(np.std(step_times))
+
+def detect_cycle(y):
+    contacts, _ = detect_foot_contacts(y, fps=FPS)
+    if len(contacts) < 2:
+        return None
+
+    mid = len(contacts) // 2
+    if mid == 0:
+        return int(contacts[0]), int(contacts[1])
+
+    return int(contacts[mid - 1]), int(contacts[mid])
+
+# ==============================
+# VIDEO PROCESS
+# ==============================
+def process_video(path, conf):
+    cap = cv2.VideoCapture(path)
+
+    res = {
+        "Genou G": [],
+        "Genou D": [],
+        "Arriere-pied G": [],
+        "Arriere-pied D": [],
+        "Bassin": [],
+        "Tronc": [],
+    }
+
+    heelG_y, heelD_y = [], []
+    frames = []
+
+    while cap.isOpened():
+        r, f = cap.read()
+        if not r:
+            break
+        frames.append(f.copy())
+
+        kp = detect_pose(f)
+        if kp is None:
+            for k in res:
+                res[k].append(np.nan)
+            heelG_y.append(np.nan)
+            heelD_y.append(np.nan)
+            continue
+
+        def ok(n):
+            return kp.get(f"{n} vis", 0.0) >= conf
+
+        # Genou frontal = angle cuisse / jambe
+        res["Genou G"].append(
+            angle_genou_frontal(kp["Hanche G"], kp["Genou G"], kp["Cheville G"], side="G")
+            if (ok("Hanche G") and ok("Genou G") and ok("Cheville G")) else np.nan
+        )
+        res["Genou D"].append(
+            angle_genou_frontal(kp["Hanche D"], kp["Genou D"], kp["Cheville D"], side="D")
+            if (ok("Hanche D") and ok("Genou D") and ok("Cheville D")) else np.nan
+        )
+
+        # Arrière-pied frontal stable
+        res["Arriere-pied G"].append(
+            angle_arriere_pied_frontal(kp["Cheville G"], kp["Talon G"], side="G")
+            if (ok("Cheville G") and ok("Talon G")) else np.nan
+        )
+        res["Arriere-pied D"].append(
+            angle_arriere_pied_frontal(kp["Cheville D"], kp["Talon D"], side="D")
+            if (ok("Cheville D") and ok("Talon D")) else np.nan
+        )
+
+        # Bassin
+        res["Bassin"].append(
+            angle_bassin_frontal(kp["Hanche G"], kp["Hanche D"])
+            if (ok("Hanche G") and ok("Hanche D")) else np.nan
+        )
+
+        # Tronc
+        res["Tronc"].append(
+            angle_tronc_frontal(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"])
+            if (ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D")) else np.nan
+        )
+
+        heelG_y.append(float(kp["Talon G"][1]) if ok("Talon G") else np.nan)
+        heelD_y.append(float(kp["Talon D"][1]) if ok("Talon D") else np.nan)
+
+    cap.release()
+    return res, heelG_y, heelD_y, frames
+
+# ==============================
+# ANNOTATION IMAGES
+# ==============================
+def draw_segment_with_angle(img_bgr, p1, p2, ang_deg, label, color=(0, 255, 0)):
+    h, w = img_bgr.shape[:2]
+    P1 = (int(p1[0] * w), int(p1[1] * h))
+    P2 = (int(p2[0] * w), int(p2[1] * h))
+
+    cv2.line(img_bgr, P1, P2, color, 4)
+    cv2.circle(img_bgr, P1, 6, (0, 0, 255), -1)
+    cv2.circle(img_bgr, P2, 6, (0, 0, 255), -1)
+
+    txt = f"{label}: {ang_deg:.1f}°"
+    tx, ty = P2[0] + 10, P2[1] - 10
+    cv2.rectangle(img_bgr, (tx - 4, ty - 30), (tx + 190, ty + 6), (0, 0, 0), -1)
+    cv2.putText(
+        img_bgr, txt, (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA
+    )
+
+def annotate_frame(frame_bgr, kp, conf=0.30):
+    if kp is None:
+        return frame_bgr
+
+    def ok(n):
+        return kp.get(f"{n} vis", 0.0) >= conf
+
+    out = frame_bgr.copy()
+
+    # Genou G
+    if ok("Hanche G") and ok("Genou G") and ok("Cheville G"):
+        draw_segment_with_angle(
+            out, kp["Hanche G"], kp["Genou G"],
+            angle_genou_frontal(kp["Hanche G"], kp["Genou G"], kp["Cheville G"], side="G"),
+            "Genou G"
+        )
+        h, w = out.shape[:2]
+        K = (int(kp["Genou G"][0] * w), int(kp["Genou G"][1] * h))
+        A = (int(kp["Cheville G"][0] * w), int(kp["Cheville G"][1] * h))
+        cv2.line(out, K, A, (0, 255, 0), 4)
+
+    # Genou D
+    if ok("Hanche D") and ok("Genou D") and ok("Cheville D"):
+        draw_segment_with_angle(
+            out, kp["Hanche D"], kp["Genou D"],
+            angle_genou_frontal(kp["Hanche D"], kp["Genou D"], kp["Cheville D"], side="D"),
+            "Genou D"
+        )
+        h, w = out.shape[:2]
+        K = (int(kp["Genou D"][0] * w), int(kp["Genou D"][1] * h))
+        A = (int(kp["Cheville D"][0] * w), int(kp["Cheville D"][1] * h))
+        cv2.line(out, K, A, (0, 255, 0), 4)
+
+    # Arrière-pied G
+    if ok("Cheville G") and ok("Talon G"):
+        draw_segment_with_angle(
+            out, kp["Talon G"], kp["Cheville G"],
+            angle_arriere_pied_frontal(kp["Cheville G"], kp["Talon G"], side="G"),
+            "AP G"
+        )
+
+    # Arrière-pied D
+    if ok("Cheville D") and ok("Talon D"):
+        draw_segment_with_angle(
+            out, kp["Talon D"], kp["Cheville D"],
+            angle_arriere_pied_frontal(kp["Cheville D"], kp["Talon D"], side="D"),
+            "AP D"
+        )
+
+    # Bassin
+    if ok("Hanche G") and ok("Hanche D"):
+        draw_segment_with_angle(
+            out, kp["Hanche G"], kp["Hanche D"],
+            angle_bassin_frontal(kp["Hanche G"], kp["Hanche D"]),
+            "Bassin"
+        )
+
+    # Tronc
+    if ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D"):
+        mid_sh = (kp["Epaule G"] + kp["Epaule D"]) / 2.0
+        mid_hip = (kp["Hanche G"] + kp["Hanche D"]) / 2.0
+        draw_segment_with_angle(
+            out, mid_hip, mid_sh,
+            angle_tronc_frontal(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"]),
+            "Tronc"
+        )
+
+    return out
+
+# ==============================
+# ASYMETRIE
+# ==============================
+def asym_percent(left, right):
+    if left is None or right is None:
+        return None
+    denom = (left + right) / 2.0
+    if abs(denom) < 1e-6:
+        return None
+    return 100.0 * abs(right - left) / abs(denom)
+
+# ==============================
+# PDF EXPORT
+# ==============================
+def export_pdf(patient, keyframe_path, figures, table_data, annotated_images,
+               asym_table=None, temporal_info=None, contact_fig_path=None):
+    out_path = os.path.join(tempfile.gettempdir(), f"GaitScan_{patient['nom']}_{patient['prenom']}.pdf")
+
+    doc = SimpleDocTemplate(
+        out_path, pagesize=A4,
+        leftMargin=1.7 * cm, rightMargin=1.7 * cm,
+        topMargin=1.7 * cm, bottomMargin=1.7 * cm
+    )
+
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("<b>GaitScan Pro – Analyse Frontale / Vue arrière</b>", styles["Title"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+    story.append(Paragraph(
+        f"<b>Patient :</b> {patient['nom']} {patient['prenom']}<br/>"
+        f"<b>Date :</b> {datetime.now().strftime('%d/%m/%Y')}<br/>"
+        f"<b>Angle de film :</b> {patient.get('camera','N/A')}<br/>"
+        f"<b>Affichage phases :</b> {patient.get('phase','N/A')}<br/>"
+        f"<b>Norme affichée :</b> {'Oui' if patient.get('show_norm', True) else 'Non'}<br/>"
+        f"<b>Taille :</b> {patient.get('taille_cm','N/A')} cm",
+        styles["Normal"]
+    ))
+    story.append(Spacer(1, 0.35 * cm))
+
+    if temporal_info is not None:
+        story.append(Paragraph("<b>Paramètres temporels</b>", styles["Heading2"]))
+        txt = ""
+
+        if temporal_info.get("G_mean") is not None:
+            txt += (
+                f"<b>Temps du pas Gauche :</b> {temporal_info['G_mean']:.2f} s "
+                f"(± {temporal_info['G_std']:.2f} s)<br/>"
+            )
+        else:
+            txt += "<b>Temps du pas Gauche :</b> non calculable<br/>"
+
+        if temporal_info.get("D_mean") is not None:
+            txt += (
+                f"<b>Temps du pas Droit :</b> {temporal_info['D_mean']:.2f} s "
+                f"(± {temporal_info['D_std']:.2f} s)<br/>"
+            )
+        else:
+            txt += "<b>Temps du pas Droit :</b> non calculable<br/>"
+
+        txt += (
+            f"<b>Contacts détectés :</b> Gauche = {temporal_info.get('nG', 0)} "
+            f"&nbsp;&nbsp; Droit = {temporal_info.get('nD', 0)}<br/>"
+            "<i>Les contacts au sol sont estimés à partir des minima verticaux des talons.</i>"
+        )
+
+        story.append(Paragraph(txt, styles["Normal"]))
+        story.append(Spacer(1, 0.25 * cm))
+
+    if contact_fig_path is not None and os.path.exists(contact_fig_path):
+        story.append(Paragraph("<b>Contacts au sol (talons)</b>", styles["Heading2"]))
+        story.append(PDFImage(contact_fig_path, width=16 * cm, height=6 * cm))
+        story.append(Spacer(1, 0.3 * cm))
+
+    if asym_table:
+        story.append(Paragraph("<b>Asymétries droite/gauche</b>", styles["Heading2"]))
+        t = Table([["Mesure", "Moy G", "Moy D", "Asym %"]] + asym_table,
+                  colWidths=[6 * cm, 3 * cm, 3 * cm, 3 * cm])
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.7, colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("ALIGN", (1, 1), (-1, -1), "CENTER")
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 0.35 * cm))
+
+    story.append(Paragraph("<b>Image clé</b>", styles["Heading2"]))
+    story.append(PDFImage(keyframe_path, width=16 * cm, height=8 * cm))
+    story.append(Spacer(1, 0.4 * cm))
+
+    story.append(Paragraph("<b>Analyse frontale</b>", styles["Heading2"]))
+    story.append(Spacer(1, 0.2 * cm))
+    for joint, figpath in figures.items():
+        story.append(Paragraph(f"<b>{joint}</b>", styles["Heading3"]))
+        story.append(PDFImage(figpath, width=16 * cm, height=6 * cm))
+        story.append(Spacer(1, 0.3 * cm))
+
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(Paragraph("<b>Synthèse (°)</b>", styles["Heading2"]))
+
+    table = Table([["Mesure", "Min", "Moyenne", "Max"]] + table_data,
+                  colWidths=[7 * cm, 3 * cm, 3 * cm, 3 * cm])
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.7, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER")
+    ]))
+    story.append(table)
+
+    if annotated_images:
+        story.append(PageBreak())
+        story.append(Paragraph("<b>Images annotées</b>", styles["Heading2"]))
+        story.append(Spacer(1, 0.2 * cm))
+        for img in annotated_images:
+            story.append(PDFImage(img, width=16 * cm, height=8 * cm))
+            story.append(Spacer(1, 0.25 * cm))
+
+    doc.build(story)
+    return out_path
+
+# ==============================
+# PDF VIEW + PRINT
+# ==============================
+def pdf_viewer_with_print(pdf_bytes: bytes, height=800):
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    html = f"""
+    <div style="display:flex; gap:12px; align-items:center; margin: 6px 0 10px 0;">
+      <button onclick="printPdf()" style="padding:10px 14px; font-size:16px; cursor:pointer;">
+        🖨️ Imprimer le rapport
+      </button>
+      <span style="opacity:0.7;">(ouvre la boîte d’impression du navigateur)</span>
+    </div>
+    <iframe id="pdfFrame" src="data:application/pdf;base64,{b64}" width="100%" height="{height}px" style="border:1px solid #ddd; border-radius:8px;"></iframe>
+    <script>
+      function printPdf() {{
+        const iframe = document.getElementById('pdfFrame');
+        iframe.contentWindow.focus();
+        iframe.contentWindow.print();
+      }}
+    </script>
+    """
+    components.html(html, height=height + 80, scrolling=True)
+
+# ==============================
+# UI
+# ==============================
+with st.sidebar:
+    nom = st.text_input("Nom", "DURAND")
+    prenom = st.text_input("Prénom", "Jean")
+    camera_pos = st.selectbox("Angle de film", ["Devant", "Derrière"])
+    phase_cote = st.selectbox("Phases", ["Aucune", "Droite", "Gauche", "Les deux"])
+    smooth = st.slider("Lissage (patient)", 0, 10, 3)
+    conf = st.slider("Seuil confiance", 0.1, 0.9, 0.3, 0.05)
+
+    taille_cm = st.number_input("Taille du patient (cm)", min_value=80, max_value=230, value=170, step=1)
+
+    show_norm = st.checkbox("Afficher la norme", value=True)
+    norm_smooth_win = st.slider(
+        "Lissage norme (simple)", 1, 21, 7, 2,
+        help="Moyenne glissante. 1 = pas de lissage."
+    )
+
+video = st.file_uploader("Vidéo", ["mp4", "avi", "mov"])
+
+# ==============================
+# ANALYSE
+# ==============================
+if video and st.button("▶ Lancer l'analyse"):
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.write(video.read())
+    tmp.close()
+
+    data, heelG, heelD, frames = process_video(tmp.name, conf)
+    os.unlink(tmp.name)
+
+    contactsG, heelG_s = detect_foot_contacts(heelG, fps=FPS)
+    contactsD, heelD_s = detect_foot_contacts(heelD, fps=FPS)
+
+    step_times_G, step_time_G_mean, step_time_G_std = compute_step_times(contactsG, fps=FPS)
+    step_times_D, step_time_D_mean, step_time_D_std = compute_step_times(contactsD, fps=FPS)
+
+    phases = []
+    if phase_cote in ["Gauche", "Les deux"]:
+        c = detect_cycle(heelG)
+        if c:
+            phases.append((*c, "orange"))
+    if phase_cote in ["Droite", "Les deux"]:
+        c = detect_cycle(heelD)
+        if c:
+            phases.append((*c, "blue"))
+
+    st.subheader("📐 Paramètres frontaux")
+    st.caption("Analyse frontale : genou (angle cuisse-jambe), arrière-pied, bassin et tronc.")
+
+    st.subheader("⏱️ Temps du pas")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if step_time_G_mean is not None:
+            st.write(f"**Temps du pas Gauche :** {step_time_G_mean:.2f} s")
+            st.write(f"**Variabilité Gauche :** ± {step_time_G_std:.2f} s")
+            st.write(f"**Nombre de contacts Gauche :** {len(contactsG)}")
+        else:
+            st.write("**Temps du pas Gauche :** non calculable")
+
+    with col2:
+        if step_time_D_mean is not None:
+            st.write(f"**Temps du pas Droit :** {step_time_D_mean:.2f} s")
+            st.write(f"**Variabilité Droit :** ± {step_time_D_std:.2f} s")
+            st.write(f"**Nombre de contacts Droit :** {len(contactsD)}")
+        else:
+            st.write("**Temps du pas Droit :** non calculable")
+
+    st.caption("Les contacts au sol sont estimés à partir des minima verticaux des talons.")
+
+    keyframe_path = os.path.join(tempfile.gettempdir(), "keyframe.png")
+    cv2.imwrite(keyframe_path, frames[len(frames) // 2])
+
+    figures = {}
+    table_data = []
+    asym_rows = []
+
+    metrics_pairs = [
+        ("Genou", "Genou G", "Genou D"),
+        ("Arriere-pied", "Arriere-pied G", "Arriere-pied D"),
+    ]
+
+    metrics_single = [
+        ("Bassin", "Bassin"),
+        ("Tronc", "Tronc"),
+    ]
+
+    # Courbes bilatérales
+    for label, left_key, right_key in metrics_pairs:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})
+
+        g_raw = np.array(data[left_key], dtype=float)
+        d_raw = np.array(data[right_key], dtype=float)
+
+        local_smooth = smooth + 2 if label == "Arriere-pied" else smooth
+        g = smooth_clinical(g_raw, smooth_level=local_smooth)
+        d = smooth_clinical(d_raw, smooth_level=local_smooth)
+
+        ax1.plot(g, label="Gauche", color="red")
+        ax1.plot(d, label="Droite", color="blue")
+        ax1.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)
+        ax1.set_ylim(-25, 25)
+        for c0, c1, col in phases:
+            ax1.axvspan(c0, c1, color=col, alpha=0.3)
+        ax1.set_title(f"{label} – Analyse frontale")
+        ax1.set_ylabel("Angle (°)")
+        ax1.legend()
+
+        if show_norm:
+            norm = norm_curve(left_key, len(g))
+            norm = smooth_ma(norm, win=norm_smooth_win)
+            ax2.plot(norm, color="green")
+            ax2.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)
+            ax2.set_ylim(-25, 25)
+            ax2.set_title("Norme (indicative)")
+        else:
+            ax2.axis("off")
+
+        st.pyplot(fig)
+
+        fig_path = os.path.join(tempfile.gettempdir(), f"{label}_plot.png")
+        fig.savefig(fig_path, bbox_inches="tight")
+        plt.close(fig)
+        figures[label] = fig_path
+
+        def stats(arr_filtered, arr_raw):
+            mask = ~np.isnan(arr_raw)
+            if mask.sum() == 0:
+                return np.nan, np.nan, np.nan, None
+            vals = arr_filtered[mask]
+            return float(np.min(vals)), float(np.mean(vals)), float(np.max(vals)), float(np.mean(vals))
+
+        gmin, gmean, gmax, gmean_only = stats(g, g_raw)
+        dmin, dmean, dmax, dmean_only = stats(d, d_raw)
+
+        table_data.append([f"{label} Gauche", f"{gmin:.1f}", f"{gmean:.1f}", f"{gmax:.1f}"])
+        table_data.append([f"{label} Droite", f"{dmin:.1f}", f"{dmean:.1f}", f"{dmax:.1f}"])
+
+        a = asym_percent(gmean_only, dmean_only)
+        if a is None:
+            asym_rows.append([
+                label,
+                f"{gmean_only:.1f}" if gmean_only is not None else "NA",
+                f"{dmean_only:.1f}" if dmean_only is not None else "NA",
+                "NA"
+            ])
+        else:
+            asym_rows.append([label, f"{gmean_only:.1f}", f"{dmean_only:.1f}", f"{a:.1f}"])
+
+    # Courbes globales
+    for label, key in metrics_single:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})
+
+        raw = np.array(data[key], dtype=float)
+        val = smooth_clinical(raw, smooth_level=smooth)
+
+        ax1.plot(val, label=label, color="purple")
+        ax1.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)
+        ax1.set_ylim(-15, 15)
+        for c0, c1, col in phases:
+            ax1.axvspan(c0, c1, color=col, alpha=0.3)
+        ax1.set_title(f"{label} – Analyse frontale")
+        ax1.set_ylabel("Angle (°)")
+        ax1.legend()
+
+        if show_norm:
+            norm = norm_curve(key, len(val))
+            norm = smooth_ma(norm, win=norm_smooth_win)
+            ax2.plot(norm, color="green")
+            ax2.axhline(0, linestyle="--", linewidth=1, color="black", alpha=0.6)
+            ax2.set_ylim(-15, 15)
+            ax2.set_title("Norme (indicative)")
+        else:
+            ax2.axis("off")
+
+        st.pyplot(fig)
+
+        fig_path = os.path.join(tempfile.gettempdir(), f"{label}_plot.png")
+        fig.savefig(fig_path, bbox_inches="tight")
+        plt.close(fig)
+        figures[label] = fig_path
+
+        mask = ~np.isnan(raw)
+        if mask.sum() == 0:
+            vmin = vmean = vmax = np.nan
+        else:
+            vals = val[mask]
+            vmin = float(np.min(vals))
+            vmean = float(np.mean(vals))
+            vmax = float(np.max(vals))
+
+        table_data.append([label, f"{vmin:.1f}", f"{vmean:.1f}", f"{vmax:.1f}"])
+
+    st.subheader("↔️ Asymétries droite/gauche")
+    for row in asym_rows:
+        st.write(f"**{row[0]}** — Moy G: {row[1]}° | Moy D: {row[2]}° | Asym: {row[3]}%")
+
+    st.subheader("🦶 Contacts au sol (talons)")
+    fig_contact, ax = plt.subplots(figsize=(12, 4))
+
+    x = np.arange(len(heelG_s)) / FPS
+    ax.plot(x, heelG_s, label="Talon Gauche", color="red")
+    ax.plot(x, heelD_s, label="Talon Droit", color="blue")
+
+    if len(contactsG) > 0:
+        ax.plot(contactsG / FPS, heelG_s[contactsG], "o", color="red")
+    for c in contactsG:
+        ax.axvline(c / FPS, color="red", alpha=0.15)
+
+    if len(contactsD) > 0:
+        ax.plot(contactsD / FPS, heelD_s[contactsD], "o", color="blue")
+    for c in contactsD:
+        ax.axvline(c / FPS, color="blue", alpha=0.15)
+
+    ax.set_title("Détection des contacts au sol")
+    ax.set_xlabel("Temps (s)")
+    ax.legend()
+    st.pyplot(fig_contact)
+
+    contact_fig_path = os.path.join(tempfile.gettempdir(), "contacts_sol.png")
+    fig_contact.savefig(contact_fig_path, bbox_inches="tight")
+    plt.close(fig_contact)
+
+    st.subheader("📸 Captures annotées")
+    num_photos = st.slider("Nombre d'images extraites", 1, 10, 3)
+    total_frames = len(frames)
+    idxs = np.linspace(0, total_frames - 1, num_photos, dtype=int)
+
+    annotated_images = []
+    for i, idx in enumerate(idxs):
+        frame = frames[idx]
+        kp = detect_pose(frame)
+        ann = annotate_frame(frame, kp, conf=conf)
+
+        out_img = os.path.join(tempfile.gettempdir(), f"annotated_{i}.png")
+        cv2.imwrite(out_img, ann)
+        annotated_images.append(out_img)
+
+        st.image(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB), caption=f"Image annotée {i+1} (frame {idx})")
+
+    temporal_info = {
+        "G_mean": step_time_G_mean,
+        "G_std": step_time_G_std,
+        "D_mean": step_time_D_mean,
+        "D_std": step_time_D_std,
+        "nG": len(contactsG),
+        "nD": len(contactsD),
+    }
+
+    pdf_path = export_pdf(
+        patient={
+            "nom": nom,
+            "prenom": prenom,
+            "camera": camera_pos,
+            "phase": phase_cote,
+            "taille_cm": int(taille_cm),
+            "show_norm": bool(show_norm)
+        },
+        keyframe_path=keyframe_path,
+        figures=figures,
+        table_data=table_data,
+        annotated_images=annotated_images,
+        asym_table=asym_rows,
+        temporal_info=temporal_info,
+        contact_fig_path=contact_fig_path
+    )
+
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    st.success("✅ Rapport généré")
+    st.download_button(
+        "📄 Télécharger le rapport PDF",
+        data=pdf_bytes,
+        file_name=f"GaitScan_{nom}_{prenom}.pdf",
+        mime="application/pdf"
+    )
+"""
+
+CINEMATIQUE_CODE = r"""
+import streamlit as st
+import cv2, os, tempfile, base64
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy.signal import find_peaks
+import mediapipe as mp
+
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Image as PDFImage,
+    Spacer, Table, TableStyle, PageBreak
+)
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+
+import streamlit.components.v1 as components
+
+# ==============================
+# CONFIG
+# ==============================
+st.set_page_config("GaitScan Pro (MediaPipe)", layout="wide")
+st.title("🏃 GaitScan Pro – Analyse Cinématique")
+FPS = 30
+
+# ==============================
+# MEDIAPIPE
+# ==============================
+mp_pose = mp.solutions.pose
+
+@st.cache_resource
+def load_pose():
+    return mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=1,
+        smooth_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+pose = load_pose()
+
+# ==============================
+# NORMES
+# ==============================
+def norm_curve(joint, n):
+    x = np.linspace(0, 100, n)
+    if joint == "Genou":
+        return np.interp(x, [0, 15, 40, 60, 80, 100], [5, 15, 5, 40, 60, 5])
+    if joint == "Hanche":
+        return np.interp(x, [0, 30, 60, 100], [30, 0, -10, 30])
+    if joint == "Cheville":
+        return np.interp(x, [0, 10, 50, 70, 100], [5, 10, 25, 10, 5])
+    if joint == "Tronc":
+        return np.zeros(n)
+    return np.zeros(n)
+
+def smooth_ma(y, win=7):
+    y = np.asarray(y, dtype=float)
+    if win is None or win <= 1:
+        return y
+    win = int(win)
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    ypad = np.pad(y, (pad, pad), mode="edge")
+    kernel = np.ones(win, dtype=float) / win
+    return np.convolve(ypad, kernel, mode="valid")
+
+# ==============================
+# OUTLIERS + LISSAGE CLINIQUE
+# ==============================
+def interp_nan(arr):
+    arr = np.asarray(arr, dtype=float)
+    idx = np.arange(len(arr))
+    ok = ~np.isnan(arr)
+    if ok.sum() >= 2:
+        return np.interp(idx, idx[ok], arr[ok])
+    return np.zeros_like(arr)
+
+def remove_outliers_hampel(x, win=5, n_sigmas=3.0):
+    x = np.asarray(x, dtype=float).copy()
+    n = len(x)
+    if n < 3:
+        return x
+
+    y = x.copy()
+    k = 1.4826
+
+    for i in range(n):
+        i0 = max(0, i - win)
+        i1 = min(n, i + win + 1)
+        w = x[i0:i1]
+        med = np.median(w)
+        mad = np.median(np.abs(w - med))
+
+        if mad < 1e-9:
+            continue
+
+        if abs(x[i] - med) > n_sigmas * k * mad:
+            y[i] = med
+
+    return y
+
+def smooth_clinical(arr, smooth_level=3):
+    x = interp_nan(arr)
+    x = remove_outliers_hampel(x, win=3 + smooth_level, n_sigmas=3.0)
+    win = max(3, 2 * smooth_level + 3)
+    if win % 2 == 0:
+        win += 1
+    return smooth_ma(x, win=win)
+
+# ==============================
+# POSE DETECTION
+# ==============================
+def detect_pose(frame):
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    res = pose.process(img_rgb)
+    if not res.pose_landmarks:
+        return None
+
+    lm = res.pose_landmarks.landmark
+    L = mp_pose.PoseLandmark
+
+    def pt(l):
+        p = lm[int(l)]
+        return np.array([p.x, p.y], dtype=np.float32), float(p.visibility)
+
+    kp = {}
+    for side, suf in [("LEFT", "G"), ("RIGHT", "D")]:
+        kp[f"Epaule {suf}"], kp[f"Epaule {suf} vis"] = pt(getattr(L, f"{side}_SHOULDER"))
+        kp[f"Hanche {suf}"], kp[f"Hanche {suf} vis"] = pt(getattr(L, f"{side}_HIP"))
+        kp[f"Genou {suf}"], kp[f"Genou {suf} vis"] = pt(getattr(L, f"{side}_KNEE"))
+        kp[f"Cheville {suf}"], kp[f"Cheville {suf} vis"] = pt(getattr(L, f"{side}_ANKLE"))
+        kp[f"Talon {suf}"], kp[f"Talon {suf} vis"] = pt(getattr(L, f"{side}_HEEL"))
+        kp[f"Orteil {suf}"], kp[f"Orteil {suf} vis"] = pt(getattr(L, f"{side}_FOOT_INDEX"))
+    return kp
+
+# ==============================
+# ANGLES
+# ==============================
+def angle(a, b, c):
+    ba = a - b
+    bc = c - b
+    ba[1] *= -1
+    bc[1] *= -1
+    cosv = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6)
+    return float(np.degrees(np.arccos(np.clip(cosv, -1, 1))))
+
+def angle_between(v1, v2):
+    v1 = np.asarray(v1, dtype=float).copy()
+    v2 = np.asarray(v2, dtype=float).copy()
+    v1[1] *= -1
+    v2[1] *= -1
+    cosv = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+    return float(np.degrees(np.arccos(np.clip(cosv, -1, 1))))
+
+def angle_hanche(e, h, g):
+    return 180 - angle(e, h, g)
+
+def angle_genou(h, g, c):
+    return 180 - angle(h, g, c)
+
+def angle_cheville_brut(g, c, t, o):
+    jambe = g - c
+    pied = o - t
+    return angle_between(jambe, pied)
+
+def angle_cheville(g, c, t, o):
+    return angle_cheville_brut(g, c, t, o) - 90.0
+
+def midpoint(p1, p2):
+    return (np.asarray(p1, dtype=float) + np.asarray(p2, dtype=float)) / 2.0
+
+def angle_tronc(epaule_g, epaule_d, hanche_g, hanche_d):
+    ep_mid = midpoint(epaule_g, epaule_d)
+    ha_mid = midpoint(hanche_g, hanche_d)
+    v = ep_mid - ha_mid
+    v[1] *= -1
+    return float(np.degrees(np.arctan2(v[0], v[1] + 1e-6)))
+
+# ==============================
+# CONTACTS SOL + CYCLE
+# ==============================
+def detect_foot_contacts(y, fps=FPS):
+    y = np.asarray(y, dtype=float)
+
+    if np.isnan(y).any():
+        idx = np.arange(len(y))
+        ok = ~np.isnan(y)
+        if ok.sum() >= 2:
+            y = np.interp(idx, idx[ok], y[ok])
+        else:
+            return np.array([], dtype=int), y
+
+    y_s = smooth_clinical(y, smooth_level=2)
+
+    inv = -y_s
+    min_distance = max(1, int(0.35 * fps))
+    prominence = max(1e-6, np.std(inv) * 0.2)
+
+    peaks, _ = find_peaks(inv, distance=min_distance, prominence=prominence)
+    return peaks, y_s
+
+def compute_step_times(contact_idx, fps=FPS):
+    contact_idx = np.asarray(contact_idx, dtype=int)
+    if len(contact_idx) < 2:
+        return [], None, None
+
+    step_times = np.diff(contact_idx) / float(fps)
+    return step_times.tolist(), float(np.mean(step_times)), float(np.std(step_times))
+
+def detect_cycle(y):
+    contacts, _ = detect_foot_contacts(y, fps=FPS)
+    if len(contacts) < 2:
+        return None
+
+    mid = len(contacts) // 2
+    if mid == 0:
+        return int(contacts[0]), int(contacts[1])
+
+    return int(contacts[mid - 1]), int(contacts[mid])
+
+# ==============================
+# VIDEO PROCESS
+# ==============================
+def process_video(path, conf):
+    cap = cv2.VideoCapture(path)
+    res = {k: [] for k in ["Tronc", "Hanche G", "Hanche D", "Genou G", "Genou D", "Cheville G", "Cheville D"]}
+
+    heelG_y, heelD_y = [], []
+    heelG_x, heelD_x = [], []
+    toeG_x, toeD_x = [], []
+
+    frames = []
+
+    while cap.isOpened():
+        r, f = cap.read()
+        if not r:
+            break
+        frames.append(f.copy())
+
+        kp = detect_pose(f)
+        if kp is None:
+            for k in res:
+                res[k].append(np.nan)
+            heelG_y.append(np.nan)
+            heelD_y.append(np.nan)
+            heelG_x.append(np.nan)
+            heelD_x.append(np.nan)
+            toeG_x.append(np.nan)
+            toeD_x.append(np.nan)
+            continue
+
+        def ok(n):
+            return kp.get(f"{n} vis", 0.0) >= conf
+
+        res["Tronc"].append(
+            angle_tronc(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"])
+            if (ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D")) else np.nan
+        )
+
+        res["Hanche G"].append(
+            angle_hanche(kp["Epaule G"], kp["Hanche G"], kp["Genou G"])
+            if (ok("Epaule G") and ok("Hanche G") and ok("Genou G")) else np.nan
+        )
+        res["Hanche D"].append(
+            angle_hanche(kp["Epaule D"], kp["Hanche D"], kp["Genou D"])
+            if (ok("Epaule D") and ok("Hanche D") and ok("Genou D")) else np.nan
+        )
+
+        res["Genou G"].append(
+            angle_genou(kp["Hanche G"], kp["Genou G"], kp["Cheville G"])
+            if (ok("Hanche G") and ok("Genou G") and ok("Cheville G")) else np.nan
+        )
+        res["Genou D"].append(
+            angle_genou(kp["Hanche D"], kp["Genou D"], kp["Cheville D"])
+            if (ok("Hanche D") and ok("Genou D") and ok("Cheville D")) else np.nan
+        )
+
+        res["Cheville G"].append(
+            angle_cheville(kp["Genou G"], kp["Cheville G"], kp["Talon G"], kp["Orteil G"])
+            if (ok("Genou G") and ok("Cheville G") and ok("Talon G") and ok("Orteil G")) else np.nan
+        )
+        res["Cheville D"].append(
+            angle_cheville(kp["Genou D"], kp["Cheville D"], kp["Talon D"], kp["Orteil D"])
+            if (ok("Genou D") and ok("Cheville D") and ok("Talon D") and ok("Orteil D")) else np.nan
+        )
+
+        heelG_y.append(float(kp["Talon G"][1]) if ok("Talon G") else np.nan)
+        heelD_y.append(float(kp["Talon D"][1]) if ok("Talon D") else np.nan)
+
+        heelG_x.append(float(kp["Talon G"][0]) if ok("Talon G") else np.nan)
+        heelD_x.append(float(kp["Talon D"][0]) if ok("Talon D") else np.nan)
+
+        toeG_x.append(float(kp["Orteil G"][0]) if ok("Orteil G") else np.nan)
+        toeD_x.append(float(kp["Orteil D"][0]) if ok("Orteil D") else np.nan)
+
+    cap.release()
+    return res, heelG_y, heelD_y, heelG_x, heelD_x, toeG_x, toeD_x, frames
+
+# ==============================
+# ANNOTATION IMAGES
+# ==============================
+def draw_angle_on_frame(img_bgr, pA, pB, pC, ang_deg, color=(0, 255, 0)):
+    h, w = img_bgr.shape[:2]
+    A = (int(pA[0] * w), int(pA[1] * h))
+    B = (int(pB[0] * w), int(pB[1] * h))
+    C = (int(pC[0] * w), int(pC[1] * h))
+
+    line_th = 4
+    circle_r = 7
+    text_scale = 1.2
+    text_th = 3
+
+    cv2.line(img_bgr, A, B, color, line_th)
+    cv2.line(img_bgr, C, B, color, line_th)
+    cv2.circle(img_bgr, B, circle_r, (0, 0, 255), -1)
+
+    label = f"{int(round(ang_deg))} deg"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_th)
+    tx, ty = B[0] + 10, B[1] - 10
+    cv2.rectangle(img_bgr, (tx - 4, ty - th - 6), (tx + tw + 6, ty + 6), (0, 0, 0), -1)
+    cv2.putText(img_bgr, label, (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (255, 255, 255), text_th, cv2.LINE_AA)
+
+def draw_ankle_angle_on_frame(img_bgr, knee, ankle, heel, toe, ang_deg, color=(0, 255, 0)):
+    h, w = img_bgr.shape[:2]
+
+    K = (int(knee[0] * w), int(knee[1] * h))
+    A = (int(ankle[0] * w), int(ankle[1] * h))
+    H = (int(heel[0] * w), int(heel[1] * h))
+    T = (int(toe[0] * w), int(toe[1] * h))
+
+    line_th = 4
+    circle_r = 7
+    text_scale = 1.2
+    text_th = 3
+
+    cv2.line(img_bgr, K, A, color, line_th)
+    cv2.line(img_bgr, H, T, color, line_th)
+    cv2.circle(img_bgr, A, circle_r, (0, 0, 255), -1)
+
+    label = f"{int(round(ang_deg))} deg"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_th)
+    tx, ty = A[0] + 10, A[1] - 10
+    cv2.rectangle(img_bgr, (tx - 4, ty - th - 6), (tx + tw + 6, ty + 6), (0, 0, 0), -1)
+    cv2.putText(img_bgr, label, (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (255, 255, 255), text_th, cv2.LINE_AA)
+
+def draw_trunk_angle_on_frame(img_bgr, shoulder_mid, hip_mid, ang_deg, color=(255, 165, 0)):
+    h, w = img_bgr.shape[:2]
+
+    S = (int(shoulder_mid[0] * w), int(shoulder_mid[1] * h))
+    H = (int(hip_mid[0] * w), int(hip_mid[1] * h))
+
+    ref_len = int(0.18 * h)
+    V = (H[0], H[1] - ref_len)
+
+    line_th = 4
+    circle_r = 7
+    text_scale = 1.0
+    text_th = 3
+
+    cv2.line(img_bgr, H, S, color, line_th)
+    cv2.line(img_bgr, H, V, (200, 200, 200), 2)
+    cv2.circle(img_bgr, H, circle_r, (0, 0, 255), -1)
+
+    label = f"Tronc {ang_deg:+.1f} deg"
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, text_scale, text_th)
+    tx, ty = H[0] + 10, H[1] + 30
+    cv2.rectangle(img_bgr, (tx - 4, ty - th - 6), (tx + tw + 6, ty + 6), (0, 0, 0), -1)
+    cv2.putText(img_bgr, label, (tx, ty),
+                cv2.FONT_HERSHEY_SIMPLEX, text_scale, (255, 255, 255), text_th, cv2.LINE_AA)
+
+def annotate_frame(frame_bgr, kp, conf=0.30):
+    if kp is None:
+        return frame_bgr
+
+    def ok(n):
+        return kp.get(f"{n} vis", 0.0) >= conf
+
+    out = frame_bgr.copy()
+
+    if ok("Epaule G") and ok("Epaule D") and ok("Hanche G") and ok("Hanche D"):
+        shoulder_mid = midpoint(kp["Epaule G"], kp["Epaule D"])
+        hip_mid = midpoint(kp["Hanche G"], kp["Hanche D"])
+        draw_trunk_angle_on_frame(
+            out,
+            shoulder_mid,
+            hip_mid,
+            angle_tronc(kp["Epaule G"], kp["Epaule D"], kp["Hanche G"], kp["Hanche D"])
+        )
+
+    if ok("Epaule G") and ok("Hanche G") and ok("Genou G"):
+        draw_angle_on_frame(out, kp["Epaule G"], kp["Hanche G"], kp["Genou G"],
+                            angle_hanche(kp["Epaule G"], kp["Hanche G"], kp["Genou G"]))
+    if ok("Epaule D") and ok("Hanche D") and ok("Genou D"):
+        draw_angle_on_frame(out, kp["Epaule D"], kp["Hanche D"], kp["Genou D"],
+                            angle_hanche(kp["Epaule D"], kp["Hanche D"], kp["Genou D"]))
+
+    if ok("Hanche G") and ok("Genou G") and ok("Cheville G"):
+        draw_angle_on_frame(out, kp["Hanche G"], kp["Genou G"], kp["Cheville G"],
+                            angle_genou(kp["Hanche G"], kp["Genou G"], kp["Cheville G"]))
+    if ok("Hanche D") and ok("Genou D") and ok("Cheville D"):
+        draw_angle_on_frame(out, kp["Hanche D"], kp["Genou D"], kp["Cheville D"],
+                            angle_genou(kp["Hanche D"], kp["Genou D"], kp["Cheville D"]))
+
+    if ok("Genou G") and ok("Cheville G") and ok("Talon G") and ok("Orteil G"):
+        draw_ankle_angle_on_frame(
+            out,
+            kp["Genou G"], kp["Cheville G"], kp["Talon G"], kp["Orteil G"],
+            angle_cheville_brut(kp["Genou G"], kp["Cheville G"], kp["Talon G"], kp["Orteil G"])
+        )
+    if ok("Genou D") and ok("Cheville D") and ok("Talon D") and ok("Orteil D"):
+        draw_ankle_angle_on_frame(
+            out,
+            kp["Genou D"], kp["Cheville D"], kp["Talon D"], kp["Orteil D"],
+            angle_cheville_brut(kp["Genou D"], kp["Cheville D"], kp["Talon D"], kp["Orteil D"])
+        )
+
+    return out
+
+# ==============================
+# STEP LENGTH + ASYMMETRY
+# ==============================
+def nan_interp(x):
+    x = np.array(x, dtype=float)
+    idx = np.arange(len(x))
+    ok = ~np.isnan(x)
+    if ok.sum() >= 2:
+        return np.interp(idx, idx[ok], x[ok])
+    return None
+
+def asym_percent(left, right):
+    if left is None or right is None:
+        return None
+    denom = (left + right) / 2.0
+    if abs(denom) < 1e-6:
+        return None
+    return 100.0 * abs(right - left) / abs(denom)
+
+def compute_step_length_cm(heelG_y, heelD_y, heelG_x, heelD_x, toeG_x, toeD_x, taille_cm):
+    """
+    Longueur du pas estimée en 2D :
+    - pas gauche = distance horizontale entre talon gauche à l'attaque
+      et avant-pied droit
+    - pas droit = distance horizontale entre talon droit à l'attaque
+      et avant-pied gauche
+    """
+
+    contactsG, _ = detect_foot_contacts(heelG_y, fps=FPS)
+    contactsD, _ = detect_foot_contacts(heelD_y, fps=FPS)
+
+    hGx = nan_interp(heelG_x)
+    hDx = nan_interp(heelD_x)
+    tGx = nan_interp(toeG_x)
+    tDx = nan_interp(toeD_x)
+
+    if hGx is None or hDx is None or tGx is None or tDx is None:
+        return None, None, None, None, None
+
+    stepG_list = []
+    stepD_list = []
+
+    for i in contactsG:
+        if 0 <= i < len(hGx) and 0 <= i < len(tDx):
+            stepG_list.append(abs(hGx[i] - tDx[i]))
+
+    for i in contactsD:
+        if 0 <= i < len(hDx) and 0 <= i < len(tGx):
+            stepD_list.append(abs(hDx[i] - tGx[i]))
+
+    valid_norm = stepG_list + stepD_list
+    if len(valid_norm) == 0:
+        return None, None, None, None, None
+
+    scale = float(taille_cm) / 0.53
+
+    stepG_cm = float(np.mean(stepG_list) * scale) if len(stepG_list) > 0 else None
+    stepD_cm = float(np.mean(stepD_list) * scale) if len(stepD_list) > 0 else None
+
+    valid_cm = [v for v in [stepG_cm, stepD_cm] if v is not None]
+    step_mean_cm = float(np.mean(valid_cm))
+    step_std_cm = float(np.std(valid_cm))
+    step_asym = asym_percent(stepG_cm, stepD_cm)
+
+    return step_mean_cm, step_std_cm, stepG_cm, stepD_cm, step_asym
+
+# ==============================
+# PDF EXPORT
+# ==============================
+def export_pdf(patient, keyframe_path, figures, table_data, annotated_images,
+               step_info=None, asym_table=None, temporal_info=None, contact_fig_path=None):
+    out_path = os.path.join(tempfile.gettempdir(), f"GaitScan_{patient['nom']}_{patient['prenom']}.pdf")
+
+    doc = SimpleDocTemplate(
+        out_path, pagesize=A4,
+        leftMargin=1.7 * cm, rightMargin=1.7 * cm,
+        topMargin=1.7 * cm, bottomMargin=1.7 * cm
+    )
+
+    styles = getSampleStyleSheet()
+    story = []
+
+    story.append(Paragraph("<b>GaitScan Pro – Analyse Cinématique</b>", styles["Title"]))
+    story.append(Spacer(1, 0.2 * cm))
+
+    story.append(Paragraph(
+        f"<b>Patient :</b> {patient['nom']} {patient['prenom']}<br/>"
+        f"<b>Date :</b> {datetime.now().strftime('%d/%m/%Y')}<br/>"
+        f"<b>Angle de film :</b> {patient.get('camera','N/A')}<br/>"
+        f"<b>Affichage phases :</b> {patient.get('phase','N/A')}<br/>"
+        f"<b>Norme affichée :</b> {'Oui' if patient.get('show_norm', True) else 'Non'}<br/>"
+        f"<b>Taille :</b> {patient.get('taille_cm','N/A')} cm",
+        styles["Normal"]
+    ))
+    story.append(Spacer(1, 0.35 * cm))
+
+    if step_info is not None:
+        story.append(Paragraph("<b>Paramètres spatio-temporels (estimation)</b>", styles["Heading2"]))
+        story.append(Paragraph(
+            f"<b>Longueur de pas moyenne :</b> {step_info['mean']:.1f} cm<br/>"
+            f"<b>Variabilité :</b> ± {step_info['std']:.1f} cm<br/>"
+            + (f"<b>Pas G :</b> {step_info['G']:.1f} cm &nbsp;&nbsp; <b>Pas D :</b> {step_info['D']:.1f} cm<br/>"
+               if step_info.get("G") is not None and step_info.get("D") is not None else "")
+            + (f"<b>Asymétrie pas (G/D) :</b> {step_info['asym']:.1f} %<br/>"
+               if step_info.get("asym") is not None else "")
+            + "<i>Mesure monocaméra 2D sans calibration métrique : valeurs estimées.</i>",
+            styles["Normal"]
+        ))
+        story.append(Spacer(1, 0.25 * cm))
+
+    if temporal_info is not None:
+        story.append(Paragraph("<b>Paramètres temporels</b>", styles["Heading2"]))
+        txt = ""
+
+        if temporal_info.get("G_mean") is not None:
+            txt += (
+                f"<b>Temps du pas Gauche :</b> {temporal_info['G_mean']:.2f} s "
+                f"(± {temporal_info['G_std']:.2f} s)<br/>"
+            )
+        else:
+            txt += "<b>Temps du pas Gauche :</b> non calculable<br/>"
+
+        if temporal_info.get("D_mean") is not None:
+            txt += (
+                f"<b>Temps du pas Droit :</b> {temporal_info['D_mean']:.2f} s "
+                f"(± {temporal_info['D_std']:.2f} s)<br/>"
+            )
+        else:
+            txt += "<b>Temps du pas Droit :</b> non calculable<br/>"
+
+        txt += (
+            f"<b>Contacts détectés :</b> Gauche = {temporal_info.get('nG', 0)} "
+            f"&nbsp;&nbsp; Droit = {temporal_info.get('nD', 0)}<br/>"
+            "<i>Les contacts au sol sont estimés à partir des minima verticaux des talons.</i>"
+        )
+
+        story.append(Paragraph(txt, styles["Normal"]))
+        story.append(Spacer(1, 0.25 * cm))
+
+    if contact_fig_path is not None and os.path.exists(contact_fig_path):
+        story.append(Paragraph("<b>Contacts au sol (talons)</b>", styles["Heading2"]))
+        story.append(PDFImage(contact_fig_path, width=16 * cm, height=6 * cm))
+        story.append(Spacer(1, 0.3 * cm))
+
+    if asym_table:
+        story.append(Paragraph("<b>Asymétries droite/gauche (angles)</b>", styles["Heading2"]))
+        t = Table([["Mesure", "Moy G", "Moy D", "Asym %"]] + asym_table,
+                  colWidths=[6 * cm, 3 * cm, 3 * cm, 3 * cm])
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.7, colors.black),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+            ("ALIGN", (1, 1), (-1, -1), "CENTER")
+        ]))
+        story.append(t)
+        story.append(Spacer(1, 0.35 * cm))
+
+    story.append(Paragraph("<b>Image clé</b>", styles["Heading2"]))
+    story.append(PDFImage(keyframe_path, width=16 * cm, height=8 * cm))
+    story.append(Spacer(1, 0.4 * cm))
+
+    story.append(Paragraph("<b>Analyse articulaire</b>", styles["Heading2"]))
+    story.append(Spacer(1, 0.2 * cm))
+    for joint, figpath in figures.items():
+        story.append(Paragraph(f"<b>{joint}</b>", styles["Heading3"]))
+        story.append(PDFImage(figpath, width=16 * cm, height=6 * cm))
+        story.append(Spacer(1, 0.3 * cm))
+
+    story.append(Spacer(1, 0.2 * cm))
+    story.append(Paragraph("<b>Synthèse (°)</b>", styles["Heading2"]))
+
+    table = Table([["Mesure", "Min", "Moyenne", "Max"]] + table_data,
+                  colWidths=[7 * cm, 3 * cm, 3 * cm, 3 * cm])
+    table.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.7, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("ALIGN", (1, 1), (-1, -1), "CENTER")
+    ]))
+    story.append(table)
+
+    if annotated_images:
+        story.append(PageBreak())
+        story.append(Paragraph("<b>Images annotées (angles)</b>", styles["Heading2"]))
+        story.append(Spacer(1, 0.2 * cm))
+        for img in annotated_images:
+            story.append(PDFImage(img, width=16 * cm, height=8 * cm))
+            story.append(Spacer(1, 0.25 * cm))
+
+    doc.build(story)
+    return out_path
+
+# ==============================
+# PDF VIEW + PRINT (browser-side)
+# ==============================
+def pdf_viewer_with_print(pdf_bytes: bytes, height=800):
+    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+    html = f"""
+    <div style="display:flex; gap:12px; align-items:center; margin: 6px 0 10px 0;">
+      <button onclick="printPdf()" style="padding:10px 14px; font-size:16px; cursor:pointer;">
+        🖨️ Imprimer le rapport
+      </button>
+      <span style="opacity:0.7;">(ouvre la boîte d’impression du navigateur)</span>
+    </div>
+    <iframe id="pdfFrame" src="data:application/pdf;base64,{b64}" width="100%" height="{height}px" style="border:1px solid #ddd; border-radius:8px;"></iframe>
+    <script>
+      function printPdf() {{
+        const iframe = document.getElementById('pdfFrame');
+        iframe.contentWindow.focus();
+        iframe.contentWindow.print();
+      }}
+    </script>
+    """
+    components.html(html, height=height + 80, scrolling=True)
+
+# ==============================
+# UI
+# ==============================
+with st.sidebar:
+    nom = st.text_input("Nom", "DURAND")
+    prenom = st.text_input("Prénom", "Jean")
+    camera_pos = st.selectbox("Angle de film", ["Devant", "Droite", "Gauche"])
+    phase_cote = st.selectbox("Phases", ["Aucune", "Droite", "Gauche", "Les deux"])
+    smooth = st.slider("Lissage (patient)", 0, 10, 3)
+    conf = st.slider("Seuil confiance", 0.1, 0.9, 0.3, 0.05)
+
+    taille_cm = st.number_input("Taille du patient (cm)", min_value=80, max_value=230, value=170, step=1)
+
+    show_norm = st.checkbox("Afficher la norme", value=True)
+    norm_smooth_win = st.slider(
+        "Lissage norme (simple)", 1, 21, 7, 2,
+        help="Moyenne glissante (impair conseillé). 1 = pas de lissage."
+    )
+
+video = st.file_uploader("Vidéo", ["mp4", "avi", "mov"])
+
+# ==============================
+# ANALYSE
+# ==============================
+if video and st.button("▶ Lancer l'analyse"):
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp.write(video.read())
+    tmp.close()
+
+    data, heelG, heelD, heelG_x, heelD_x, toeG_x, toeD_x, frames = process_video(tmp.name, conf)
+    os.unlink(tmp.name)
+
+    contactsG, heelG_s = detect_foot_contacts(heelG, fps=FPS)
+    contactsD, heelD_s = detect_foot_contacts(heelD, fps=FPS)
+
+    step_times_G, step_time_G_mean, step_time_G_std = compute_step_times(contactsG, fps=FPS)
+    step_times_D, step_time_D_mean, step_time_D_std = compute_step_times(contactsD, fps=FPS)
+
+    phases = []
+    if phase_cote in ["Gauche", "Les deux"]:
+        c = detect_cycle(heelG)
+        if c:
+            phases.append((*c, "orange"))
+    if phase_cote in ["Droite", "Les deux"]:
+        c = detect_cycle(heelD)
+        if c:
+            phases.append((*c, "blue"))
+
+    step_mean, step_std, stepG_cm, stepD_cm, step_asym = compute_step_length_cm(
+        heelG, heelD, heelG_x, heelD_x, toeG_x, toeD_x, float(taille_cm)
+    )
+
+    st.subheader("📏 Paramètres spatio-temporels")
+    if step_mean is not None:
+        st.write(f"**Longueur de pas moyenne :** {step_mean:.1f} cm")
+        st.write(f"**Variabilité (±1σ) :** {step_std:.1f} cm")
+        if stepG_cm is not None and stepD_cm is not None:
+            st.write(f"**Pas G :** {stepG_cm:.1f} cm — **Pas D :** {stepD_cm:.1f} cm")
+        if step_asym is not None:
+            st.write(f"**Asymétrie pas (G/D) :** {step_asym:.1f} %")
+        st.caption("Estimation monocaméra 2D sans calibration métrique (échelle basée sur la taille).")
+    else:
+        st.warning("Longueur de pas non calculable.")
+
+    st.subheader("⏱️ Temps du pas")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if step_time_G_mean is not None:
+            st.write(f"**Temps du pas Gauche :** {step_time_G_mean:.2f} s")
+            st.write(f"**Variabilité Gauche :** ± {step_time_G_std:.2f} s")
+            st.write(f"**Nombre de contacts Gauche :** {len(contactsG)}")
+        else:
+            st.write("**Temps du pas Gauche :** non calculable")
+
+    with col2:
+        if step_time_D_mean is not None:
+            st.write(f"**Temps du pas Droit :** {step_time_D_mean:.2f} s")
+            st.write(f"**Variabilité Droit :** ± {step_time_D_std:.2f} s")
+            st.write(f"**Nombre de contacts Droit :** {len(contactsD)}")
+        else:
+            st.write("**Temps du pas Droit :** non calculable")
+
+    st.caption("Les contacts au sol sont estimés à partir des minima verticaux des talons.")
+
+    keyframe_path = os.path.join(tempfile.gettempdir(), "keyframe.png")
+    cv2.imwrite(keyframe_path, frames[len(frames) // 2])
+
+    figures = {}
+    table_data = []
+    asym_rows = []
+
+    # ----- TRONC (une seule courbe) -----
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})
+
+    trunk_raw = np.array(data["Tronc"], dtype=float)
+    trunk = smooth_clinical(trunk_raw, smooth_level=smooth)
+
+    ax1.plot(trunk, label="Tronc", color="darkorange")
+    for c0, c1, col in phases:
+        ax1.axvspan(c0, c1, color=col, alpha=0.3)
+    ax1.set_title("Tronc – Analyse")
+    ax1.legend()
+
+    if show_norm:
+        norm = norm_curve("Tronc", len(trunk))
+        norm = smooth_ma(norm, win=norm_smooth_win)
+        ax2.plot(norm, color="green")
+        ax2.set_title("Norme (lissée)" if norm_smooth_win and norm_smooth_win > 1 else "Norme")
+    else:
+        ax2.axis("off")
+
+    st.pyplot(fig)
+
+    fig_path = os.path.join(tempfile.gettempdir(), "Tronc_plot.png")
+    fig.savefig(fig_path, bbox_inches="tight")
+    plt.close(fig)
+    figures["Tronc"] = fig_path
+
+    mask = ~np.isnan(trunk_raw)
+    if mask.sum() == 0:
+        tmin, tmean, tmax = np.nan, np.nan, np.nan
+    else:
+        vals = trunk[mask]
+        tmin, tmean, tmax = float(np.min(vals)), float(np.mean(vals)), float(np.max(vals))
+
+    table_data.append(["Tronc", f"{tmin:.1f}", f"{tmean:.1f}", f"{tmax:.1f}"])
+
+    # ----- ARTICULATIONS droite/gauche -----
+    for joint in ["Hanche", "Genou", "Cheville"]:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4), gridspec_kw={"width_ratios": [2, 1]})
+
+        g_raw = np.array(data[f"{joint} G"], dtype=float)
+        d_raw = np.array(data[f"{joint} D"], dtype=float)
+
+        g = smooth_clinical(g_raw, smooth_level=smooth)
+        d = smooth_clinical(d_raw, smooth_level=smooth)
+
+        ax1.plot(g, label="Gauche", color="red")
+        ax1.plot(d, label="Droite", color="blue")
+        for c0, c1, col in phases:
+            ax1.axvspan(c0, c1, color=col, alpha=0.3)
+        ax1.set_title(f"{joint} – Analyse")
+        ax1.legend()
+
+        if show_norm:
+            norm = norm_curve(joint, len(g))
+            norm = smooth_ma(norm, win=norm_smooth_win)
+            ax2.plot(norm, color="green")
+            ax2.set_title("Norme (lissée)" if norm_smooth_win and norm_smooth_win > 1 else "Norme")
+        else:
+            ax2.axis("off")
+
+        st.pyplot(fig)
+
+        fig_path = os.path.join(tempfile.gettempdir(), f"{joint}_plot.png")
+        fig.savefig(fig_path, bbox_inches="tight")
+        plt.close(fig)
+        figures[joint] = fig_path
+
+        def stats(arr_filtered, arr_raw):
+            mask = ~np.isnan(arr_raw)
+            if mask.sum() == 0:
+                return np.nan, np.nan, np.nan, None
+            vals = arr_filtered[mask]
+            return float(np.min(vals)), float(np.mean(vals)), float(np.max(vals)), float(np.mean(vals))
+
+        gmin, gmean, gmax, gmean_only = stats(g, g_raw)
+        dmin, dmean, dmax, dmean_only = stats(d, d_raw)
+
+        table_data.append([f"{joint} Gauche", f"{gmin:.1f}", f"{gmean:.1f}", f"{gmax:.1f}"])
+        table_data.append([f"{joint} Droite", f"{dmin:.1f}", f"{dmean:.1f}", f"{dmax:.1f}"])
+
+        a = asym_percent(gmean_only, dmean_only)
+        if a is None:
+            asym_rows.append([
+                joint,
+                f"{gmean_only:.1f}" if gmean_only is not None else "NA",
+                f"{dmean_only:.1f}" if dmean_only is not None else "NA",
+                "NA"
+            ])
+        else:
+            asym_rows.append([joint, f"{gmean_only:.1f}", f"{dmean_only:.1f}", f"{a:.1f}"])
+
+    st.subheader("↔️ Asymétries droite/gauche (angles)")
+    for row in asym_rows:
+        st.write(f"**{row[0]}** — Moy G: {row[1]}° | Moy D: {row[2]}° | Asym: {row[3]}%")
+
+    st.subheader("🦶 Contacts au sol (talons)")
+    fig_contact, ax = plt.subplots(figsize=(12, 4))
+
+    x = np.arange(len(heelG_s)) / FPS
+    ax.plot(x, heelG_s, label="Talon Gauche", color="red")
+    ax.plot(x, heelD_s, label="Talon Droit", color="blue")
+
+    if len(contactsG) > 0:
+        ax.plot(contactsG / FPS, heelG_s[contactsG], "o", color="red")
+    for c in contactsG:
+        ax.axvline(c / FPS, color="red", alpha=0.15)
+
+    if len(contactsD) > 0:
+        ax.plot(contactsD / FPS, heelD_s[contactsD], "o", color="blue")
+    for c in contactsD:
+        ax.axvline(c / FPS, color="blue", alpha=0.15)
+
+    ax.set_title("Détection des contacts au sol")
+    ax.set_xlabel("Temps (s)")
+    ax.legend()
+    st.pyplot(fig_contact)
+
+    contact_fig_path = os.path.join(tempfile.gettempdir(), "contacts_sol.png")
+    fig_contact.savefig(contact_fig_path, bbox_inches="tight")
+    plt.close(fig_contact)
+
+    st.subheader("📸 Captures annotées (angles)")
+    num_photos = st.slider("Nombre d'images extraites", 1, 10, 3)
+    total_frames = len(frames)
+    idxs = np.linspace(0, total_frames - 1, num_photos, dtype=int)
+
+    annotated_images = []
+    for i, idx in enumerate(idxs):
+        frame = frames[idx]
+        kp = detect_pose(frame)
+        ann = annotate_frame(frame, kp, conf=conf)
+
+        out_img = os.path.join(tempfile.gettempdir(), f"annotated_{i}.png")
+        cv2.imwrite(out_img, ann)
+        annotated_images.append(out_img)
+
+        st.image(cv2.cvtColor(ann, cv2.COLOR_BGR2RGB), caption=f"Image annotée {i+1} (frame {idx})")
+
+    step_info = None
+    if step_mean is not None:
+        step_info = {"mean": step_mean, "std": step_std, "G": stepG_cm, "D": stepD_cm, "asym": step_asym}
+
+    temporal_info = {
+        "G_mean": step_time_G_mean,
+        "G_std": step_time_G_std,
+        "D_mean": step_time_D_mean,
+        "D_std": step_time_D_std,
+        "nG": len(contactsG),
+        "nD": len(contactsD),
+    }
+
+    pdf_path = export_pdf(
+        patient={
+            "nom": nom,
+            "prenom": prenom,
+            "camera": camera_pos,
+            "phase": phase_cote,
+            "taille_cm": int(taille_cm),
+            "show_norm": bool(show_norm)
+        },
+        keyframe_path=keyframe_path,
+        figures=figures,
+        table_data=table_data,
+        annotated_images=annotated_images,
+        step_info=step_info,
+        asym_table=asym_rows,
+        temporal_info=temporal_info,
+        contact_fig_path=contact_fig_path
+    )
+
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
+
+    st.success("✅ Rapport généré")
+    st.download_button(
+        "📄 Télécharger le rapport PDF",
+        data=pdf_bytes,
+        file_name=f"GaitScan_{nom}_{prenom}.pdf",
+        mime="application/pdf"
+    )
+"""
+
+POSTURE_FRONTALE_CODE = r"""
+import streamlit as st
+st.set_page_config(page_title="Analyseur Postural Pro (MediaPipe)", layout="wide")
+
+import os
+import tempfile
+import numpy as np
+import cv2
+from PIL import Image
+import math
+from fpdf import FPDF
+from datetime import datetime
+import io
+
+import mediapipe as mp
+from streamlit_image_coordinates import streamlit_image_coordinates
+
+st.title("🧍 Analyseur Postural Pro (MediaPipe)")
+st.markdown("---")
+
+# =========================
+# 1) MEDIAPIPE
+# =========================
+mp_pose = mp.solutions.pose
+
+@st.cache_resource
+def load_pose():
+    return mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=1,
+        smooth_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+pose = load_pose()
+
+# =========================
+# 2) OUTILS
+# =========================
+def rotate_if_landscape(img_np_rgb: np.ndarray) -> np.ndarray:
+    if img_np_rgb.shape[1] > img_np_rgb.shape[0]:
+        img_np_rgb = cv2.rotate(img_np_rgb, cv2.ROTATE_90_CLOCKWISE)
+    return img_np_rgb
+
+def ensure_uint8_rgb(img: np.ndarray) -> np.ndarray:
+    """Force image RGB uint8 contiguë."""
+    if img is None:
+        return None
+    if img.dtype != np.uint8:
+        img = img.astype(np.float32)
+        if img.max() <= 1.5:
+            img = img * 255.0
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    if not img.flags["C_CONTIGUOUS"]:
+        img = np.ascontiguousarray(img)
+    return img
+
+def to_png_bytes(img_rgb_uint8: np.ndarray) -> bytes:
+    """Encode en PNG bytes (ultra robuste)."""
+    img_rgb_uint8 = ensure_uint8_rgb(img_rgb_uint8)
+    pil = Image.fromarray(img_rgb_uint8, mode="RGB")
+    bio = io.BytesIO()
+    pil.save(bio, format="PNG")
+    return bio.getvalue()
+
+def calculate_angle(p1, p2, p3) -> float:
+    v1 = np.array([p1[0]-p2[0], p1[1]-p2[1]], dtype=float)
+    v2 = np.array([p3[0]-p2[0], p3[1]-p2[1]], dtype=float)
+    dot = float(np.dot(v1, v2))
+    mag = float(np.linalg.norm(v1) * np.linalg.norm(v2))
+    if mag == 0:
+        return 0.0
+    return math.degrees(math.acos(np.clip(dot / mag, -1, 1)))
+
+def femur_tibia_knee_angle(hip, knee, ankle) -> float:
+    return calculate_angle(hip, knee, ankle)
+
+def tibia_rearfoot_ankle_angle(knee, ankle, heel) -> float:
+    return calculate_angle(knee, ankle, heel)
+
+def pdf_safe(text) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    s = (s.replace("°", " deg")
+           .replace("–", "-")
+           .replace("—", "-")
+           .replace("’", "'")
+           .replace("“", '"')
+           .replace("”", '"'))
+    return s.encode("latin-1", errors="ignore").decode("latin-1")
+
+def crop_to_landmarks(img_rgb_uint8: np.ndarray, res_pose, pad_ratio: float = 0.18) -> np.ndarray:
+    """Cadrage auto autour du corps à partir des landmarks MediaPipe."""
+    if res_pose is None or not res_pose.pose_landmarks:
+        return img_rgb_uint8
+
+    h, w = img_rgb_uint8.shape[:2]
+    xs, ys = [], []
+    for lm in res_pose.pose_landmarks.landmark:
+        if lm.visibility < 0.2:
+            continue
+        xs.append(lm.x * w)
+        ys.append(lm.y * h)
+
+    if not xs or not ys:
+        return img_rgb_uint8
+
+    x1, x2 = max(0, int(min(xs))), min(w-1, int(max(xs)))
+    y1, y2 = max(0, int(min(ys))), min(h-1, int(max(ys)))
+
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    pad_x = int(bw * pad_ratio)
+    pad_y = int(bh * pad_ratio)
+
+    x1 = max(0, x1 - pad_x)
+    x2 = min(w-1, x2 + pad_x)
+    y1 = max(0, y1 - pad_y)
+    y2 = min(h-1, y2 + pad_y)
+
+    if x2 <= x1 or y2 <= y1:
+        return img_rgb_uint8
+
+    return img_rgb_uint8[y1:y2, x1:x2].copy()
+
+def _to_float(val):
+    if val is None:
+        return None
+    s = str(val).replace(",", ".")
+    num = ""
+    for ch in s:
+        if ch.isdigit() or ch in ".-":
+            num += ch
+        elif num:
+            break
+    try:
+        return float(num)
+    except:
+        return None
+
+def _badge(status: str):
+    if status == "OK":
+        return "🟢 OK"
+    if status == "SURV":
+        return "🟠 À surveiller"
+    return "🔴 À corriger"
+
+def _status_from_mm(mm: float):
+    if mm is None:
+        return "SURV"
+    if mm < 5:
+        return "OK"
+    if mm < 10:
+        return "SURV"
+    return "ALERTE"
+
+def _status_from_deg(deg: float):
+    if deg is None:
+        return "SURV"
+    if deg < 2:
+        return "OK"
+    if deg < 5:
+        return "SURV"
+    return "ALERTE"
+
+# =========================
+# PDF PRO (EN MÉMOIRE + COMPAT FPDF)
+# =========================
+def generate_pdf(data: dict, img_rgb_uint8: np.ndarray) -> bytes:
+    from fpdf import FPDF
+    import os
+    import tempfile
+    from PIL import Image
+    from datetime import datetime
+
+    def _pdf_safe(text):
+        if text is None:
+            return ""
+        s = str(text)
+        s = (s.replace("°", " deg")
+               .replace("–", "-")
+               .replace("—", "-")
+               .replace("’", "'")
+               .replace("“", '"')
+               .replace("”", '"')
+               .replace("\xa0", " "))
+        return s.encode("latin-1", errors="ignore").decode("latin-1")
+
+    def _to_float(val):
+        try:
+            s = str(val).replace(",", ".")
+            num = ""
+            for ch in s:
+                if ch.isdigit() or ch in ".-":
+                    num += ch
+                elif num:
+                    break
+            return float(num)
+        except:
+            return None
+
+    def _status_mm(v):
+        if v is None:
+            return "A SURV"
+        if v < 5:
+            return "OK"
+        if v < 10:
+            return "A SURV"
+        return "ALERTE"
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    # Bandeau
+    pdf.set_fill_color(31, 73, 125)
+    pdf.rect(0, 0, 210, 35, 'F')
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Arial", 'B', 20)
+    pdf.set_y(10)
+    pdf.cell(0, 10, "COMPTE-RENDU POSTURAL (IA)", align="C", ln=True)
+
+    # Infos patient
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(42)
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(120, 8, _pdf_safe(f"Patient : {data.get('Nom','')}"), ln=0)
+    pdf.set_font("Arial", '', 11)
+    pdf.cell(70, 8, datetime.now().strftime("%d/%m/%Y %H:%M"), ln=1, align="R")
+    pdf.ln(2)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    # ================= IMAGE (FIT DANS LA PAGE + PLUS PETITE + CENTRÉE) =================
+    tmp_img = os.path.join(tempfile.gettempdir(), "posture_tmp.png")
+    Image.fromarray(img_rgb_uint8).save(tmp_img)
+
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 7, "Photographie annotée", ln=True)
+
+    # Position actuelle et espace disponible
+    y = pdf.get_y()
+    page_w = pdf.w - 2 * pdf.l_margin
+    avail_h = pdf.h - pdf.b_margin - y
+
+    # Ratio image
+    ih, iw = img_rgb_uint8.shape[:2]
+    aspect = iw / ih  # largeur/hauteur
+
+    # Largeur cible "plus petite"
+    target_w = page_w * 0.62   # <-- diminue (0.5 / 0.45) si tu veux encore plus petit
+    target_h = target_w / aspect
+
+    # S'assurer que ça rentre verticalement (sinon FPDF pousse sur page suivante => page blanche)
+    if target_h > avail_h:
+        target_h = avail_h
+        target_w = target_h * aspect
+
+    x = (pdf.w - target_w) / 2
+    pdf.image(tmp_img, x=x, y=y, w=target_w, h=target_h)
+    pdf.set_y(y + target_h + 4)
+
+    # Synthèse
+    sh_mm = _to_float(data.get("Dénivelé Épaules (mm)"))
+    hip_mm = _to_float(data.get("Dénivelé Bassin (mm)"))
+
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 7, "Synthèse", ln=True)
+    pdf.set_font("Arial", '', 11)
+    pdf.cell(0, 6, _pdf_safe(f"- Épaules : {data.get('Dénivelé Épaules (mm)','—')} [{_status_mm(sh_mm)}]"), ln=True)
+    pdf.cell(0, 6, _pdf_safe(f"- Bassin  : {data.get('Dénivelé Bassin (mm)','—')} [{_status_mm(hip_mm)}]"), ln=True)
+    pdf.ln(3)
+
+    # Tableau
+    pdf.set_font("Arial", 'B', 12)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(120, 9, "Indicateur", 1, 0, 'L', True)
+    pdf.cell(70, 9, "Valeur", 1, 1, 'C', True)
+
+    pdf.set_font("Arial", '', 11)
+    for k, v in data.items():
+        if k != "Nom":
+            pdf.cell(120, 8, _pdf_safe(k), 1, 0, 'L')
+            pdf.cell(70, 8, _pdf_safe(v), 1, 1, 'C')
+
+    # Observations
+    pdf.ln(4)
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 7, "Observations automatiques", ln=True)
+    pdf.set_font("Arial", '', 11)
+
+    obs = []
+    obs.append("Analyse générée automatiquement à partir d'une image 2D.")
+    obs.append("Les mesures dépendent de la qualité de la prise de vue.")
+
+    for o in obs:
+        pdf.multi_cell(190, 6, _pdf_safe(f"- {o}"))
+
+    # Footer
+    pdf.set_y(-18)
+    pdf.set_font("Arial", 'I', 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 10, "Document indicatif - Ne remplace pas un avis médical.", align="C")
+
+    if os.path.exists(tmp_img):
+        try:
+            os.remove(tmp_img)
+        except Exception:
+            pass
+
+    out = pdf.output(dest="S")
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    return out.encode("latin-1")
+
+# =========================
+# POINTS ORIGINE + PREVIEW
+# =========================
+def extract_origin_points_from_mediapipe(img_rgb_uint8: np.ndarray):
+    res = pose.process(img_rgb_uint8)
+    if not res.pose_landmarks:
+        return {}
+    lm = res.pose_landmarks.landmark
+    L = mp_pose.PoseLandmark
+    h, w = img_rgb_uint8.shape[:2]
+
+    def pt_px(enum_):
+        p = lm[enum_.value]
+        return (float(p.x * w), float(p.y * h))
+
+    return {
+        "Genou G": pt_px(L.LEFT_KNEE),
+        "Genou D": pt_px(L.RIGHT_KNEE),
+        "Cheville G": pt_px(L.LEFT_ANKLE),
+        "Cheville D": pt_px(L.RIGHT_ANKLE),
+        "Talon G": pt_px(L.LEFT_HEEL),
+        "Talon D": pt_px(L.RIGHT_HEEL),
+
+        "Hanche G": pt_px(L.LEFT_HIP),
+        "Hanche D": pt_px(L.RIGHT_HIP),
+
+        "_Epaule G": pt_px(L.LEFT_SHOULDER),
+        "_Epaule D": pt_px(L.RIGHT_SHOULDER),
+    }
+
+def draw_preview(img_disp_rgb_uint8: np.ndarray, origin_points: dict, override_one: dict, scale: float) -> np.ndarray:
+    out = img_disp_rgb_uint8.copy()
+    out_bgr = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+
+    for name, p in origin_points.items():
+        if name.startswith("_"):
+            continue
+        x = int(p[0] * scale)
+        y = int(p[1] * scale)
+        cv2.circle(out_bgr, (x, y), 6, (0, 255, 0), -1)
+
+    for name, p in override_one.items():
+        x = int(p[0] * scale)
+        y = int(p[1] * scale)
+        cv2.circle(out_bgr, (x, y), 10, (255, 0, 255), 3)
+        cv2.line(out_bgr, (x - 12, y), (x + 12, y), (255, 0, 255), 2)
+        cv2.line(out_bgr, (x, y - 12), (x, y + 12), (255, 0, 255), 2)
+        cv2.putText(out_bgr, name, (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
+
+    return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+
+# =========================
+# 3) SESSION STATE
+# =========================
+if "override_one" not in st.session_state:
+    st.session_state["override_one"] = {}  # {"Cheville G": (x,y)}
+
+# =========================
+# 4) UI
+# =========================
+with st.sidebar:
+    st.header("👤 Dossier Patient")
+    nom = st.text_input("Nom complet", value="Anonyme")
+    taille_cm = st.number_input("Taille (cm)", min_value=100, max_value=220, value=170)
+
+    st.divider()
+    source = st.radio("Source de l'image", ["📷 Caméra", "📁 Téléverser une photo"])
+
+    st.divider()
+    st.subheader("🖱️ Correction avant analyse")
+    enable_click_edit = st.checkbox("Activer correction par clic", value=True)
+
+    editable_points = ["Hanche G", "Hanche D", "Genou G", "Genou D", "Cheville G", "Cheville D", "Talon G", "Talon D"]
+    point_to_edit = st.selectbox("Point à corriger", editable_points, disabled=not enable_click_edit)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("↩️ Reset point", disabled=not enable_click_edit):
+            st.session_state["override_one"].pop(point_to_edit, None)
+    with c2:
+        if st.button("🧹 Reset tout", disabled=not enable_click_edit):
+            st.session_state["override_one"] = {}
+
+    st.divider()
+    st.subheader("🖼️ Affichage")
+    disp_w_user = st.slider("Largeur d'affichage (px)", min_value=320, max_value=900, value=520, step=10)
+    auto_crop = st.checkbox("Cadrage automatique (autour du corps)", value=True)
+
+col_input, col_result = st.columns([1, 1])
+
+# =========================
+# 5) INPUT IMAGE
+# =========================
+with col_input:
+    if source == "📷 Caméra":
+        image_data = st.camera_input("Capturez la posture")
+    else:
+        image_data = st.file_uploader("Format JPG/PNG", type=["jpg", "png", "jpeg"])
+
+if not image_data:
+    st.stop()
+
+if isinstance(image_data, Image.Image):
+    img_np = np.array(image_data.convert("RGB"))
+else:
+    img_np = np.array(Image.open(image_data).convert("RGB"))
+
+img_np = rotate_if_landscape(img_np)
+img_np = ensure_uint8_rgb(img_np)
+
+# Cadrage auto (optionnel) sans casser le reste
+res_for_crop = pose.process(img_np)
+if auto_crop:
+    img_np = crop_to_landmarks(img_np, res_for_crop, pad_ratio=0.18)
+    img_np = ensure_uint8_rgb(img_np)
+
+h, w = img_np.shape[:2]
+
+# =========================
+# 6) PREVIEW CLIQUABLE
+# =========================
+with col_input:
+    st.subheader("📌 Cliquez pour placer le point sélectionné (avant analyse)")
+    st.caption("Verts = points d'origine | Violet = point corrigé")
+
+    disp_w = min(int(disp_w_user), w)
+    scale = disp_w / w
+    disp_h = int(h * scale)
+
+    img_disp = cv2.resize(img_np, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+    img_disp = ensure_uint8_rgb(img_disp)
+
+    origin_points = extract_origin_points_from_mediapipe(img_np)
+    preview = draw_preview(img_disp, origin_points, st.session_state["override_one"], scale)
+
+    coords = streamlit_image_coordinates(
+        Image.open(io.BytesIO(to_png_bytes(preview))),
+        key="img_click",
+    )
+
+    if enable_click_edit and coords is not None:
+        cx = float(coords["x"])
+        cy = float(coords["y"])
+        x_orig = cx / scale
+        y_orig = cy / scale
+        st.session_state["override_one"][point_to_edit] = (x_orig, y_orig)
+        st.success(f"✅ {point_to_edit} placé à ({x_orig:.0f}, {y_orig:.0f}) px")
+
+    if st.session_state["override_one"]:
+        st.write("**Point(s) corrigé(s) enregistré(s) :**")
+        for k, (x, y) in st.session_state["override_one"].items():
+            st.write(f"- {k} → ({x:.0f}, {y:.0f})")
+
+# =========================
+# 7) ANALYSE
+# =========================
+with col_result:
+    st.subheader("⚙️ Analyse")
+    run = st.button("▶ Lancer l'analyse")
+
+if not run:
+    st.stop()
+
+with st.spinner("Détection (MediaPipe) + calculs..."):
+    res = pose.process(img_np)
+    if not res.pose_landmarks:
+        st.error("Aucune pose détectée. Photo plus nette, en pied, bien centrée.")
+        st.stop()
+
+    lm = res.pose_landmarks.landmark
+    L = mp_pose.PoseLandmark
+
+    def pt(enum_):
+        p = lm[enum_.value]
+        return np.array([p.x * w, p.y * h], dtype=np.float32)
+
+    LS = pt(L.LEFT_SHOULDER)
+    RS = pt(L.RIGHT_SHOULDER)
+    LH = pt(L.LEFT_HIP)
+    RH = pt(L.RIGHT_HIP)
+    LK = pt(L.LEFT_KNEE)
+    RK = pt(L.RIGHT_KNEE)
+    LA = pt(L.LEFT_ANKLE)
+    RA = pt(L.RIGHT_ANKLE)
+    LHE = pt(L.LEFT_HEEL)
+    RHE = pt(L.RIGHT_HEEL)
+
+    POINTS = {
+        "Epaule G": LS, "Epaule D": RS,
+        "Hanche G": LH, "Hanche D": RH,
+        "Genou G": LK, "Genou D": RK,
+        "Cheville G": LA, "Cheville D": RA,
+        "Talon G": LHE, "Talon D": RHE,
+    }
+
+    for k, (x, y) in st.session_state["override_one"].items():
+        if k in POINTS:
+            POINTS[k] = np.array([x, y], dtype=np.float32)
+
+    LS = POINTS["Epaule G"]; RS = POINTS["Epaule D"]
+    LH = POINTS["Hanche G"]; RH = POINTS["Hanche D"]
+    LK = POINTS["Genou G"];  RK = POINTS["Genou D"]
+    LA = POINTS["Cheville G"]; RA = POINTS["Cheville D"]
+    LHE = POINTS["Talon G"]; RHE = POINTS["Talon D"]
+
+    raw_sh = math.degrees(math.atan2(LS[1]-RS[1], LS[0]-RS[0]))
+    shoulder_angle = abs(raw_sh)
+    if shoulder_angle > 90:
+        shoulder_angle = abs(shoulder_angle - 180)
+
+    raw_hip = math.degrees(math.atan2(LH[1]-RH[1], LH[0]-RH[0]))
+    hip_angle = abs(raw_hip)
+    if hip_angle > 90:
+        hip_angle = abs(hip_angle - 180)
+
+    knee_l = femur_tibia_knee_angle(LH, LK, LA)
+    knee_r = femur_tibia_knee_angle(RH, RK, RA)
+    ankle_l = tibia_rearfoot_ankle_angle(LK, LA, LHE)
+    ankle_r = tibia_rearfoot_ankle_angle(RK, RA, RHE)
+
+    px_height = max(LA[1], RA[1]) - min(LS[1], RS[1])
+    mm_per_px = (float(taille_cm) * 10.0) / px_height if px_height > 0 else 0.0
+    diff_shoulders_mm = abs(LS[1] - RS[1]) * mm_per_px
+    diff_hips_mm = abs(LH[1] - RH[1]) * mm_per_px
+
+    shoulder_lower = "Gauche" if LS[1] > RS[1] else "Droite"
+    hip_lower = "Gauche" if LH[1] > RH[1] else "Droite"
+
+    ann_bgr = cv2.cvtColor(img_np.copy(), cv2.COLOR_RGB2BGR)
+
+    for _, p in POINTS.items():
+        cv2.circle(ann_bgr, tuple(p.astype(int)), 7, (0, 255, 0), -1)
+
+    for name in list(st.session_state["override_one"].keys()):
+        if name in POINTS:
+            p = POINTS[name]
+            cv2.circle(ann_bgr, tuple(p.astype(int)), 14, (255, 0, 255), 3)
+            cv2.putText(ann_bgr, name, (int(p[0]) + 10, int(p[1]) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+
+    cv2.line(ann_bgr, tuple(LS.astype(int)), tuple(RS.astype(int)), (255, 0, 0), 3)
+    cv2.line(ann_bgr, tuple(LH.astype(int)), tuple(RH.astype(int)), (255, 0, 0), 3)
+
+    annotated = cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB)
+    annotated = ensure_uint8_rgb(annotated)
+
+    results = {
+        "Nom": nom,
+        "Inclinaison Épaules (0=horizon)": f"{shoulder_angle:.1f}°",
+        "Épaule la plus basse": shoulder_lower,
+        "Dénivelé Épaules (mm)": f"{diff_shoulders_mm:.1f} mm",
+        "Inclinaison Bassin (0=horizon)": f"{hip_angle:.1f}°",
+        "Bassin le plus bas": hip_lower,
+        "Dénivelé Bassin (mm)": f"{diff_hips_mm:.1f} mm",
+        "Angle Genou Gauche (fémur-tibia)": f"{knee_l:.1f}°",
+        "Angle Genou Droit (fémur-tibia)": f"{knee_r:.1f}°",
+        "Angle Cheville G (tibia-arrière-pied)": f"{ankle_l:.1f}°",
+        "Angle Cheville D (tibia-arrière-pied)": f"{ankle_r:.1f}°",
+    }
+
+# =========================
+# 8) SORTIE (WEB + PDF)
+# =========================
+with col_result:
+    st.subheader("🧾 Compte-rendu d'analyse posturale")
+
+    sh_deg = _to_float(results.get("Inclinaison Épaules (0=horizon)"))
+    hip_deg = _to_float(results.get("Inclinaison Bassin (0=horizon)"))
+    sh_mm = _to_float(results.get("Dénivelé Épaules (mm)"))
+    hip_mm = _to_float(results.get("Dénivelé Bassin (mm)"))
+
+    st.markdown("### 🧑‍⚕️ Identité")
+    st.write(f"**Patient :** {nom}")
+    st.write(f"**Taille déclarée :** {taille_cm} cm")
+    st.write(f"**Date/heure :** {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+    st.markdown("---")
+    st.markdown("### 📌 Synthèse (mêmes données que le PDF)")
+
+    sh_status = _status_from_mm(sh_mm)
+    hip_status = _status_from_mm(hip_mm)
+    sh_deg_status = _status_from_deg(sh_deg)
+    hip_deg_status = _status_from_deg(hip_deg)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown("**Épaules (mm)**")
+        st.write(results.get("Dénivelé Épaules (mm)", "—"))
+        st.write(_badge(sh_status))
+    with c2:
+        st.markdown("**Épaules (°)**")
+        st.write(results.get("Inclinaison Épaules (0=horizon)", "—"))
+        st.write(_badge(sh_deg_status))
+    with c3:
+        st.markdown("**Bassin (mm)**")
+        st.write(results.get("Dénivelé Bassin (mm)", "—"))
+        st.write(_badge(hip_status))
+    with c4:
+        st.markdown("**Bassin (°)**")
+        st.write(results.get("Inclinaison Bassin (0=horizon)", "—"))
+        st.write(_badge(hip_deg_status))
+
+    st.markdown("### 🧩 Détails")
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("**Alignement frontal**")
+        st.write(f"- Inclinaison épaules : {results.get('Inclinaison Épaules (0=horizon)', '—')}")
+        st.write(f"- Épaule la plus basse : {results.get('Épaule la plus basse', '—')}")
+        st.write(f"- Dénivelé épaules : {results.get('Dénivelé Épaules (mm)', '—')}")
+        st.write("")
+        st.write(f"- Inclinaison bassin : {results.get('Inclinaison Bassin (0=horizon)', '—')}")
+        st.write(f"- Bassin le plus bas : {results.get('Bassin le plus bas', '—')}")
+        st.write(f"- Dénivelé bassin : {results.get('Dénivelé Bassin (mm)', '—')}")
+
+    with right:
+        st.markdown("**Membres inférieurs**")
+        st.write(f"- Genou G (fémur-tibia) : {results.get('Angle Genou Gauche (fémur-tibia)', '—')}")
+        st.write(f"- Genou D (fémur-tibia) : {results.get('Angle Genou Droit (fémur-tibia)', '—')}")
+        st.write("")
+        st.write(f"- Cheville G (tibia-arrière-pied) : {results.get('Angle Cheville G (tibia-arrière-pied)', '—')}")
+        st.write(f"- Cheville D (tibia-arrière-pied) : {results.get('Angle Cheville D (tibia-arrière-pied)', '—')}")
+
+    st.markdown("### ✅ Observations automatiques")
+    obs = []
+    if sh_status == "ALERTE" or sh_deg_status == "ALERTE":
+        obs.append("Épaules : asymétrie marquée (contrôle clinique recommandé).")
+    elif sh_status == "SURV" or sh_deg_status == "SURV":
+        obs.append("Épaules : légère asymétrie (à surveiller).")
+    else:
+        obs.append("Épaules : alignement satisfaisant.")
+
+    if hip_status == "ALERTE" or hip_deg_status == "ALERTE":
+        obs.append("Bassin : bascule marquée (contrôle clinique recommandé).")
+    elif hip_status == "SURV" or hip_deg_status == "SURV":
+        obs.append("Bassin : légère bascule (à surveiller).")
+    else:
+        obs.append("Bassin : alignement satisfaisant.")
+
+    for o in obs:
+        st.write(f"- {o}")
+
+    st.markdown("### 📝 Tableau des mesures (identique PDF)")
+    st.table(results)
+
+    st.markdown("### 🖼️ Image annotée")
+    st.image(
+        Image.fromarray(annotated, mode="RGB"),
+        caption="Points verts = utilisés | Violet = corrigé",
+        use_column_width=True
+    )
+
+    st.markdown("---")
+    st.subheader("📄 PDF")
+    pdf_bytes = generate_pdf(results, annotated)
+    pdf_name = f"Bilan_{pdf_safe(results.get('Nom','Anonyme')).replace(' ', '_')}.pdf"
+    st.download_button(
+        label="📥 Télécharger le Bilan PDF",
+        data=pdf_bytes,
+        file_name=pdf_name,
+        mime="application/pdf",
+    )
+"""
+
+POSTURE_LATERALE_CODE = r"""
+import streamlit as st
+from fpdf import FPDF
+from PIL import Image
+from streamlit_image_coordinates import streamlit_image_coordinates
+
+st.set_page_config(page_title="Analyseur Postural Latéral", layout="wide")
+st.title("🧍 Analyseur Postural Latéral (MediaPipe)")
+st.markdown("Mesure sur **un seul côté visible** : jambe, cuisse, tronc et tête par rapport à la verticale.")
+st.markdown("---")
+
+mp_pose = mp.solutions.pose
+
+@st.cache_resource
+def load_pose():
+    return mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=1,
+        smooth_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+pose = load_pose()
+
+
+def ensure_uint8_rgb(img: np.ndarray) -> np.ndarray:
+    if img is None:
+        return None
+    if img.dtype != np.uint8:
+        img = img.astype(np.float32)
+        if img.max() <= 1.5:
+            img = img * 255.0
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    if not img.flags["C_CONTIGUOUS"]:
+        img = np.ascontiguousarray(img)
+    return img
+
+
+def rotate_if_landscape(img_np_rgb: np.ndarray) -> np.ndarray:
+    if img_np_rgb.shape[1] > img_np_rgb.shape[0]:
+        img_np_rgb = cv2.rotate(img_np_rgb, cv2.ROTATE_90_CLOCKWISE)
+    return img_np_rgb
+
+
+def to_png_bytes(img_rgb_uint8: np.ndarray) -> bytes:
+    pil = Image.fromarray(ensure_uint8_rgb(img_rgb_uint8), mode="RGB")
+    bio = io.BytesIO()
+    pil.save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def pdf_safe(text) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    s = (s.replace("°", " deg")
+           .replace("–", "-")
+           .replace("—", "-")
+           .replace("’", "'")
+           .replace("“", '"')
+           .replace("”", '"'))
+    return s.encode("latin-1", errors="ignore").decode("latin-1")
+
+
+def _to_float(val):
+    if val is None:
+        return None
+    s = str(val).replace(",", ".")
+    num = ""
+    for ch in s:
+        if ch.isdigit() or ch in ".-":
+            num += ch
+        elif num:
+            break
+    try:
+        return float(num)
+    except Exception:
+        return None
+
+
+def _badge(status: str):
+    if status == "OK":
+        return "🟢 OK"
+    if status == "SURV":
+        return "🟠 À surveiller"
+    return "🔴 À corriger"
+
+
+def _status_from_deg(deg: float):
+    if deg is None:
+        return "SURV"
+    if deg < 2:
+        return "OK"
+    if deg < 5:
+        return "SURV"
+    return "ALERTE"
+
+
+def calculate_angle(p1, p2, p3) -> float:
+    v1 = np.array([p1[0] - p2[0], p1[1] - p2[1]], dtype=float)
+    v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]], dtype=float)
+    dot = float(np.dot(v1, v2))
+    mag = float(np.linalg.norm(v1) * np.linalg.norm(v2))
+    if mag == 0:
+        return 0.0
+    return math.degrees(math.acos(np.clip(dot / mag, -1, 1)))
+
+
+def angle_segment_vs_vertical(p1, p2) -> float:
+    dx = float(p2[0] - p1[0])
+    dy = float(p2[1] - p1[1])
+    return math.degrees(math.atan2(abs(dx), abs(dy) + 1e-9))
+
+
+def signed_angle_segment_vs_vertical(p1, p2) -> float:
+    dx = float(p2[0] - p1[0])
+    dy = float(p2[1] - p1[1])
+    return math.degrees(math.atan2(dx, abs(dy) + 1e-9))
+
+
+def crop_to_landmarks(img_rgb_uint8: np.ndarray, res_pose, pad_ratio: float = 0.18) -> np.ndarray:
+    if res_pose is None or not res_pose.pose_landmarks:
+        return img_rgb_uint8
+    h, w = img_rgb_uint8.shape[:2]
+    xs, ys = [], []
+    for lm in res_pose.pose_landmarks.landmark:
+        if getattr(lm, "visibility", 1.0) < 0.2:
+            continue
+        xs.append(lm.x * w)
+        ys.append(lm.y * h)
+    if not xs or not ys:
+        return img_rgb_uint8
+    x1, x2 = max(0, int(min(xs))), min(w - 1, int(max(xs)))
+    y1, y2 = max(0, int(min(ys))), min(h - 1, int(max(ys)))
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    pad_x = int(bw * pad_ratio)
+    pad_y = int(bh * pad_ratio)
+    x1 = max(0, x1 - pad_x)
+    x2 = min(w - 1, x2 + pad_x)
+    y1 = max(0, y1 - pad_y)
+    y2 = min(h - 1, y2 + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return img_rgb_uint8
+    return img_rgb_uint8[y1:y2, x1:x2].copy()
+
+
+def choose_visible_side(landmarks):
+    L = mp_pose.PoseLandmark
+    left_ids = [L.LEFT_SHOULDER, L.LEFT_HIP, L.LEFT_KNEE, L.LEFT_ANKLE, L.LEFT_HEEL, L.LEFT_EAR]
+    right_ids = [L.RIGHT_SHOULDER, L.RIGHT_HIP, L.RIGHT_KNEE, L.RIGHT_ANKLE, L.RIGHT_HEEL, L.RIGHT_EAR]
+
+    left_score = sum(float(getattr(landmarks[i.value], "visibility", 0.0)) for i in left_ids)
+    right_score = sum(float(getattr(landmarks[i.value], "visibility", 0.0)) for i in right_ids)
+    return "left" if left_score >= right_score else "right"
+
+
+def extract_points(img_rgb_uint8: np.ndarray):
+    res = pose.process(img_rgb_uint8)
+    if not res.pose_landmarks:
+        return None, None
+    lm = res.pose_landmarks.landmark
+    side = choose_visible_side(lm)
+    h, w = img_rgb_uint8.shape[:2]
+    L = mp_pose.PoseLandmark
+
+    def pt(enum_):
+        p = lm[enum_.value]
+        return np.array([p.x * w, p.y * h], dtype=np.float32)
+
+    side_map = {
+        "left": {
+            "Epaule": pt(L.LEFT_SHOULDER),
+            "Hanche": pt(L.LEFT_HIP),
+            "Genou": pt(L.LEFT_KNEE),
+            "Cheville": pt(L.LEFT_ANKLE),
+            "Talon": pt(L.LEFT_HEEL),
+            "Oreille": pt(L.LEFT_EAR),
+        },
+        "right": {
+            "Epaule": pt(L.RIGHT_SHOULDER),
+            "Hanche": pt(L.RIGHT_HIP),
+            "Genou": pt(L.RIGHT_KNEE),
+            "Cheville": pt(L.RIGHT_ANKLE),
+            "Talon": pt(L.RIGHT_HEEL),
+            "Oreille": pt(L.RIGHT_EAR),
+        },
+    }
+    points = side_map[side]
+    points["Nez"] = pt(L.NOSE)
+    return side, points
+
+
+def draw_preview(img_disp_rgb_uint8: np.ndarray, origin_points: dict, override_points: dict, scale: float) -> np.ndarray:
+    out_bgr = cv2.cvtColor(img_disp_rgb_uint8.copy(), cv2.COLOR_RGB2BGR)
+    for name, p in origin_points.items():
+        x = int(p[0] * scale)
+        y = int(p[1] * scale)
+        cv2.circle(out_bgr, (x, y), 6, (0, 255, 0), -1)
+        cv2.putText(out_bgr, name, (x + 6, y - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+    for name, p in override_points.items():
+        x = int(p[0] * scale)
+        y = int(p[1] * scale)
+        cv2.circle(out_bgr, (x, y), 10, (255, 0, 255), 3)
+        cv2.line(out_bgr, (x - 12, y), (x + 12, y), (255, 0, 255), 2)
+        cv2.line(out_bgr, (x, y - 12), (x, y + 12), (255, 0, 255), 2)
+    return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+
+
+def generate_pdf(data: dict, img_rgb_uint8: np.ndarray) -> bytes:
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_fill_color(31, 73, 125)
+    pdf.rect(0, 0, 210, 35, 'F')
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Arial", 'B', 18)
+    pdf.set_y(10)
+    pdf.cell(0, 10, "COMPTE-RENDU POSTURAL LATERAL", align="C", ln=True)
+
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_y(42)
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(120, 8, pdf_safe(f"Patient : {data.get('Nom', '')}"), ln=0)
+    pdf.set_font("Arial", '', 11)
+    pdf.cell(70, 8, datetime.now().strftime("%d/%m/%Y %H:%M"), ln=1, align="R")
+    pdf.ln(2)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+
+    tmp_img = os.path.join(tempfile.gettempdir(), "posture_lateral_tmp.png")
+    Image.fromarray(img_rgb_uint8).save(tmp_img)
+
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 7, "Photographie annotée", ln=True)
+    y = pdf.get_y()
+    page_w = pdf.w - 2 * pdf.l_margin
+    avail_h = pdf.h - pdf.b_margin - y
+    ih, iw = img_rgb_uint8.shape[:2]
+    aspect = iw / ih
+    target_w = page_w * 0.62
+    target_h = target_w / aspect
+    if target_h > avail_h:
+        target_h = avail_h
+        target_w = target_h * aspect
+    x = (pdf.w - target_w) / 2
+    pdf.image(tmp_img, x=x, y=y, w=target_w, h=target_h)
+    pdf.set_y(y + target_h + 4)
+
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 7, "Synthèse", ln=True)
+    pdf.set_font("Arial", '', 11)
+    for key in [
+        "Côté détecté",
+        "Inclinaison Jambe / verticale",
+        "Inclinaison Cuisse / verticale",
+        "Inclinaison Tronc / verticale",
+        "Inclinaison Tête-Cou / verticale",
+    ]:
+        if key in data:
+            pdf.cell(0, 6, pdf_safe(f"- {key} : {data[key]}"), ln=True)
+
+    pdf.ln(3)
+    pdf.set_font("Arial", 'B', 12)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(120, 9, "Indicateur", 1, 0, 'L', True)
+    pdf.cell(70, 9, "Valeur", 1, 1, 'C', True)
+    pdf.set_font("Arial", '', 11)
+    for k, v in data.items():
+        if k != "Nom":
+            pdf.cell(120, 8, pdf_safe(k), 1, 0, 'L')
+            pdf.cell(70, 8, pdf_safe(v), 1, 1, 'C')
+
+    pdf.set_y(-18)
+    pdf.set_font("Arial", 'I', 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 10, "Document indicatif - Ne remplace pas un avis médical.", align="C")
+
+    try:
+        os.remove(tmp_img)
+    except Exception:
+        pass
+
+    out = pdf.output(dest="S")
+    if isinstance(out, (bytes, bytearray)):
+        return bytes(out)
+    return out.encode("latin-1")
+
+
+if "override_points" not in st.session_state:
+    st.session_state["override_points"] = {}
+
+with st.sidebar:
+    st.header("👤 Dossier patient")
+    nom = st.text_input("Nom complet", value="Anonyme")
+    taille_cm = st.number_input("Taille (cm)", min_value=100, max_value=230, value=170)
+    source = st.radio("Source de l'image", ["📷 Caméra", "📁 Téléverser une photo"])
+    st.divider()
+    st.subheader("🖱️ Correction avant analyse")
+    enable_click_edit = st.checkbox("Activer correction par clic", value=True)
+    point_to_edit = st.selectbox(
+        "Point à corriger",
+        ["Epaule", "Hanche", "Genou", "Cheville", "Talon", "Oreille", "Nez"],
+        disabled=not enable_click_edit,
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("↩️ Reset point", disabled=not enable_click_edit):
+            st.session_state["override_points"].pop(point_to_edit, None)
+    with c2:
+        if st.button("🧹 Reset tout", disabled=not enable_click_edit):
+            st.session_state["override_points"] = {}
+    st.divider()
+    disp_w_user = st.slider("Largeur d'affichage (px)", 320, 900, 520, 10)
+    auto_crop = st.checkbox("Cadrage automatique", value=True)
+
+col_input, col_result = st.columns([1, 1])
+
+with col_input:
+    if source == "📷 Caméra":
+        image_data = st.camera_input("Capturez la posture latérale")
+    else:
+        image_data = st.file_uploader("Format JPG/PNG", type=["jpg", "jpeg", "png"])
+
+if not image_data:
+    st.stop()
+
+if isinstance(image_data, Image.Image):
+    img_np = np.array(image_data.convert("RGB"))
+else:
+    img_np = np.array(Image.open(image_data).convert("RGB"))
+
+img_np = ensure_uint8_rgb(rotate_if_landscape(img_np))
+res_for_crop = pose.process(img_np)
+if auto_crop:
+    img_np = ensure_uint8_rgb(crop_to_landmarks(img_np, res_for_crop, pad_ratio=0.18))
+
+h, w = img_np.shape[:2]
+side_detected, origin_points = extract_points(img_np)
+if origin_points is None:
+    st.error("Aucune pose détectée. Utilisez une photo nette, de profil, en pied.")
+    st.stop()
+
+with col_input:
+    st.subheader("📌 Cliquez pour corriger le point sélectionné")
+    st.caption(f"Côté détecté automatiquement : **{'Gauche' if side_detected == 'left' else 'Droite'}**")
+    disp_w = min(int(disp_w_user), w)
+    scale = disp_w / w
+    disp_h = int(h * scale)
+    img_disp = cv2.resize(img_np, (disp_w, disp_h), interpolation=cv2.INTER_AREA)
+    preview = draw_preview(img_disp, origin_points, st.session_state["override_points"], scale)
+    coords = streamlit_image_coordinates(Image.open(io.BytesIO(to_png_bytes(preview))), key="img_click")
+    if enable_click_edit and coords is not None:
+        x_orig = float(coords["x"]) / scale
+        y_orig = float(coords["y"]) / scale
+        st.session_state["override_points"][point_to_edit] = (x_orig, y_orig)
+        st.success(f"✅ {point_to_edit} placé à ({x_orig:.0f}, {y_orig:.0f}) px")
+    if st.session_state["override_points"]:
+        st.write("**Point(s) corrigé(s) :**")
+        for k, (x, y) in st.session_state["override_points"].items():
+            st.write(f"- {k} → ({x:.0f}, {y:.0f})")
+
+with col_result:
+    st.subheader("⚙️ Analyse")
+    run = st.button("▶ Lancer l'analyse")
+
+if not run:
+    st.stop()
+
+points = {k: v.copy() for k, v in origin_points.items()}
+for k, v in st.session_state["override_points"].items():
+    if k in points:
+        points[k] = np.array([v[0], v[1]], dtype=np.float32)
+
+Epaule = points["Epaule"]
+Hanche = points["Hanche"]
+Genou = points["Genou"]
+Cheville = points["Cheville"]
+Talon = points["Talon"]
+Oreille = points["Oreille"]
+Nez = points["Nez"]
+
+incl_jambe = angle_segment_vs_vertical(Genou, Cheville)
+incl_cuisse = angle_segment_vs_vertical(Hanche, Genou)
+incl_tronc = angle_segment_vs_vertical(Hanche, Epaule)
+incl_tete_cou = angle_segment_vs_vertical(Epaule, Oreille)
+incl_tete_nez = angle_segment_vs_vertical(Oreille, Nez)
+
+signed_tronc = signed_angle_segment_vs_vertical(Hanche, Epaule)
+signed_tete = signed_angle_segment_vs_vertical(Epaule, Oreille)
+angle_genou = calculate_angle(Hanche, Genou, Cheville)
+angle_cheville = calculate_angle(Genou, Cheville, Talon)
+
+sens_tronc = "Vers l'avant" if signed_tronc > 0 else "Vers l'arrière"
+sens_tete = "Vers l'avant" if signed_tete > 0 else "Vers l'arrière"
+
+results = {
+    "Nom": nom,
+    "Plan": "Latéral",
+    "Côté détecté": "Gauche" if side_detected == "left" else "Droite",
+    "Inclinaison Jambe / verticale": f"{incl_jambe:.1f}°",
+    "Inclinaison Cuisse / verticale": f"{incl_cuisse:.1f}°",
+    "Inclinaison Tronc / verticale": f"{incl_tronc:.1f}°",
+    "Sens inclinaison tronc": sens_tronc,
+    "Inclinaison Tête-Cou / verticale": f"{incl_tete_cou:.1f}°",
+    "Sens inclinaison tête": sens_tete,
+    "Inclinaison Tête (oreille-nez)": f"{incl_tete_nez:.1f}°",
+    "Angle Genou": f"{angle_genou:.1f}°",
+    "Angle Cheville": f"{angle_cheville:.1f}°",
+}
+
+ann_bgr = cv2.cvtColor(img_np.copy(), cv2.COLOR_RGB2BGR)
+for _, p in points.items():
+    cv2.circle(ann_bgr, tuple(np.round(p).astype(int)), 7, (0, 255, 0), -1)
+for name, p in st.session_state["override_points"].items():
+    arr = np.array(p)
+    cv2.circle(ann_bgr, tuple(np.round(arr).astype(int)), 14, (255, 0, 255), 3)
+    cv2.putText(ann_bgr, name, (int(arr[0]) + 8, int(arr[1]) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+cv2.line(ann_bgr, tuple(np.round(Hanche).astype(int)), tuple(np.round(Epaule).astype(int)), (255, 0, 0), 3)
+cv2.line(ann_bgr, tuple(np.round(Hanche).astype(int)), tuple(np.round(Genou).astype(int)), (0, 200, 0), 3)
+cv2.line(ann_bgr, tuple(np.round(Genou).astype(int)), tuple(np.round(Cheville).astype(int)), (0, 255, 255), 3)
+cv2.line(ann_bgr, tuple(np.round(Epaule).astype(int)), tuple(np.round(Oreille).astype(int)), (255, 0, 255), 3)
+cv2.line(ann_bgr, tuple(np.round(Oreille).astype(int)), tuple(np.round(Nez).astype(int)), (100, 255, 100), 2)
+annotated = cv2.cvtColor(ann_bgr, cv2.COLOR_BGR2RGB)
+annotated = ensure_uint8_rgb(annotated)
+
+with col_result:
+    st.subheader("🧾 Compte-rendu d'analyse posturale")
+    st.markdown("### 🧑‍⚕️ Identité")
+    st.write(f"**Patient :** {nom}")
+    st.write(f"**Taille déclarée :** {taille_cm} cm")
+    st.write(f"**Date/heure :** {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    st.write(f"**Côté détecté :** {results['Côté détecté']}")
+    st.markdown("---")
+
+    leg_deg = _to_float(results.get("Inclinaison Jambe / verticale"))
+    thigh_deg = _to_float(results.get("Inclinaison Cuisse / verticale"))
+    trunk_deg = _to_float(results.get("Inclinaison Tronc / verticale"))
+    head_deg = _to_float(results.get("Inclinaison Tête-Cou / verticale"))
+
+    st.markdown("### 📌 Synthèse latérale")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown("**Jambe / verticale**")
+        st.write(results["Inclinaison Jambe / verticale"])
+        st.write(_badge(_status_from_deg(leg_deg)))
+    with c2:
+        st.markdown("**Cuisse / verticale**")
+        st.write(results["Inclinaison Cuisse / verticale"])
+        st.write(_badge(_status_from_deg(thigh_deg)))
+    with c3:
+        st.markdown("**Tronc / verticale**")
+        st.write(results["Inclinaison Tronc / verticale"])
+        st.write(_badge(_status_from_deg(trunk_deg)))
+    with c4:
+        st.markdown("**Tête / verticale**")
+        st.write(results["Inclinaison Tête-Cou / verticale"])
+        st.write(_badge(_status_from_deg(head_deg)))
+
+    st.markdown("### 🧩 Détails")
+    for key in [
+        "Inclinaison Jambe / verticale",
+        "Inclinaison Cuisse / verticale",
+        "Inclinaison Tronc / verticale",
+        "Sens inclinaison tronc",
+        "Inclinaison Tête-Cou / verticale",
+        "Sens inclinaison tête",
+        "Inclinaison Tête (oreille-nez)",
+        "Angle Genou",
+        "Angle Cheville",
+    ]:
+        st.write(f"- {key} : {results[key]}")
+
+    st.markdown("### ✅ Observations automatiques")
+    obs = []
+    if trunk_deg is not None:
+        obs.append("Tronc : alignement satisfaisant." if trunk_deg < 2 else "Tronc : légère inclinaison sagittale." if trunk_deg < 5 else "Tronc : inclinaison marquée.")
+    if head_deg is not None:
+        obs.append("Tête/cou : alignement satisfaisant." if head_deg < 2 else "Tête/cou : légère projection ou inclinaison." if head_deg < 5 else "Tête/cou : désalignement marqué.")
+    if leg_deg is not None:
+        obs.append("Jambe : orientation proche de la verticale." if leg_deg < 2 else "Jambe : légère inclinaison sagittale." if leg_deg < 5 else "Jambe : inclinaison marquée.")
+    for o in obs:
+        st.write(f"- {o}")
+
+    st.markdown("### 📝 Tableau des mesures")
+    st.table(results)
+
+    st.markdown("### 🖼️ Image annotée")
+    st.image(annotated, caption="Points verts = utilisés | Violet = corrigé", use_column_width=True)
+
+    st.markdown("---")
+    st.subheader("📄 PDF")
+    pdf_bytes = generate_pdf(results, annotated)
+    pdf_name = f"Bilan_Lateral_{pdf_safe(results.get('Nom', 'Anonyme')).replace(' ', '_')}.pdf"
+    st.download_button(
+        label="📥 Télécharger le Bilan PDF",
+        data=pdf_bytes,
+        file_name=pdf_name,
+        mime="application/pdf",
+    )
+"""
 
 
 # ============================================================
-# OUTILS GÉNÉRAUX
+# OUTILS COMMUNS
 # ============================================================
 class _StopLegacy(Exception):
     pass
-
-
-def split_legacy_apps(text: str) -> List[str]:
-    parts = [p.strip() for p in re.split(r"\n=+\n", text) if p.strip()]
-    cleaned: List[str] = []
-    for part in parts:
-        idx = part.find("import streamlit as st")
-        if idx >= 0:
-            part = part[idx:]
-        cleaned.append(part)
-    return cleaned
 
 
 def uploaded_to_memory(uploaded_file):
@@ -65,56 +3016,37 @@ def uploaded_to_memory(uploaded_file):
     return bio
 
 
-def safe_ascii(text: Any) -> str:
+def pdf_safe(text: Any) -> str:
     if text is None:
         return ""
     s = str(text)
-    repl = {
-        "€": "EUR",
-        "°": " deg",
-        "–": "-",
-        "—": "-",
-        "’": "'",
-        "‘": "'",
-        "“": '"',
-        "”": '"',
-        "…": "...",
-        "é": "e",
-        "è": "e",
-        "ê": "e",
-        "ë": "e",
-        "à": "a",
-        "â": "a",
-        "ä": "a",
-        "î": "i",
-        "ï": "i",
-        "ô": "o",
-        "ö": "o",
-        "ù": "u",
-        "û": "u",
-        "ü": "u",
-        "ç": "c",
+    replacements = {
+        "€": "EUR", "°": " deg", "–": "-", "—": "-", "’": "'", "‘": "'",
+        "“": '"', "”": '"', "…": "...", "é": "e", "è": "e", "ê": "e",
+        "ë": "e", "à": "a", "â": "a", "ä": "a", "î": "i", "ï": "i",
+        "ô": "o", "ö": "o", "ù": "u", "û": "u", "ü": "u", "ç": "c",
         "\xa0": " ",
     }
-    for a, b in repl.items():
+    for a, b in replacements.items():
         s = s.replace(a, b)
     s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def write_pdf_line(pdf: FPDF, text: Any) -> None:
-    content = safe_ascii(text)
-    if not content:
+def pdf_write(pdf: FPDF, text: Any) -> None:
+    t = pdf_safe(text)
+    if not t:
         return
-    chunks = [content[i:i+140] for i in range(0, len(content), 140)] or [""]
+    chunks = [t[i:i+140] for i in range(0, len(t), 140)] or [""]
     for chunk in chunks:
         try:
             pdf.multi_cell(0, 7, chunk)
         except Exception:
-            cleaned = chunk.encode("latin-1", "ignore").decode("latin-1")
-            cleaned = cleaned if cleaned.strip() else "[texte non exportable]"
-            pdf.multi_cell(0, 7, cleaned)
+            safe = chunk.encode("latin-1", "ignore").decode("latin-1")
+            if not safe.strip():
+                safe = "[texte non exportable]"
+            pdf.multi_cell(0, 7, safe)
 
 
 def build_global_pdf(patient: Dict[str, Any], module_runs: List[Dict[str, Any]]) -> bytes:
@@ -125,62 +3057,63 @@ def build_global_pdf(patient: Dict[str, Any], module_runs: List[Dict[str, Any]])
     pdf.cell(0, 10, "Compte-rendu global", ln=True)
 
     pdf.set_font("Arial", "", 11)
-    write_pdf_line(pdf, f"Patient : {patient.get('nom', '')} {patient.get('prenom', '')}")
-    write_pdf_line(pdf, f"Date : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-    write_pdf_line(pdf, f"Taille : {patient.get('taille_cm', '')} cm")
-    write_pdf_line(pdf, f"Seuil confiance : {patient.get('conf', '')}")
-    write_pdf_line(pdf, f"Lissage : {patient.get('smooth', '')}")
-    write_pdf_line(pdf, f"Afficher la norme : {'Oui' if patient.get('show_norm') else 'Non'}")
-    write_pdf_line(pdf, f"Angle de film : {patient.get('camera_pos', '')}")
-    write_pdf_line(pdf, f"Phases : {patient.get('phase_cote', '')}")
+    pdf_write(pdf, f"Patient : {patient.get('nom', '')} {patient.get('prenom', '')}")
+    pdf_write(pdf, f"Date : {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    pdf_write(pdf, f"Taille : {patient.get('taille_cm', '')} cm")
+    pdf_write(pdf, f"Seuil confiance : {patient.get('conf', '')}")
+    pdf_write(pdf, f"Lissage : {patient.get('smooth', '')}")
+    pdf_write(pdf, f"Afficher la norme : {'Oui' if patient.get('show_norm') else 'Non'}")
+    pdf_write(pdf, f"Angle de film : {patient.get('camera_pos', '')}")
+    pdf_write(pdf, f"Phases : {patient.get('phase_cote', '')}")
     pdf.ln(3)
 
     for run in module_runs:
         pdf.set_font("Arial", "B", 12)
-        write_pdf_line(pdf, run.get("title", "Module"))
+        pdf_write(pdf, run.get("title", "Module"))
         pdf.set_font("Arial", "", 11)
-        write_pdf_line(pdf, f"Statut : {run.get('status', '')}")
+        pdf_write(pdf, f"Statut : {run.get('status', '')}")
         if run.get("input_name"):
-            write_pdf_line(pdf, f"Fichier : {run['input_name']}")
+            pdf_write(pdf, f"Fichier : {run['input_name']}")
         if run.get("downloads_count", 0):
-            write_pdf_line(pdf, f"Fichiers produits par le module : {run['downloads_count']}")
+            pdf_write(pdf, f"Fichiers produits : {run['downloads_count']}")
         if run.get("error"):
-            write_pdf_line(pdf, "Erreur :")
-            write_pdf_line(pdf, run["error"].splitlines()[-1] if run["error"].splitlines() else run["error"])
+            pdf_write(pdf, "Erreur :")
+            lines = str(run["error"]).splitlines()
+            if lines:
+                pdf_write(pdf, lines[-1])
         pdf.ln(2)
 
     return bytes(pdf.output(dest="S"))
 
 
 # ============================================================
-# PROXY STREAMLIT POUR LES CODES LEGACY
+# PROXY STREAMLIT
 # ============================================================
 class LegacySidebarProxy:
-    def __init__(self, owner: "LegacyStreamlitModule", real_sidebar):
+    def __init__(self, owner, real_sidebar):
         self._owner = owner
         self._real = real_sidebar
 
     def __getattr__(self, name):
         return getattr(self._owner, name)
 
+    def __enter__(self):
+        return self
 
-class LegacyStreamlitModule(types.ModuleType):
-    def __init__(
-        self,
-        real_st,
-        shared_values: Dict[str, Any],
-        module_title: str,
-        uploaded_file,
-        launch_analysis: bool,
-    ):
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class LegacyStreamlit(types.ModuleType):
+    def __init__(self, real_st, shared, module_title, uploaded_file, launch_analysis):
         super().__init__("streamlit")
         self._real = real_st
-        self._shared = shared_values
+        self._shared = shared
         self._module_title = module_title
         self._uploaded_file = uploaded_file
         self._launch_analysis = launch_analysis
-        self._downloads: List[Dict[str, Any]] = []
-        self._logs: List[str] = []
+        self._downloads = []
+        self._logs = []
 
         self.sidebar = LegacySidebarProxy(self, real_st.sidebar)
         self.session_state = real_st.session_state
@@ -193,7 +3126,6 @@ class LegacyStreamlitModule(types.ModuleType):
     def __getattr__(self, name):
         return getattr(self._real, name)
 
-    # ---------- comportement général ----------
     def set_page_config(self, *args, **kwargs):
         return None
 
@@ -203,11 +3135,13 @@ class LegacyStreamlitModule(types.ModuleType):
     def rerun(self):
         raise _StopLegacy()
 
-    # ---------- logs ----------
-    def _log(self, prefix: str, value: Any):
-        text = safe_ascii(value)
-        if text:
-            self._logs.append(f"{prefix} {text}")
+    def _label(self, label) -> str:
+        return str(label).strip().lower()
+
+    def _log(self, prefix, value):
+        txt = pdf_safe(value)
+        if txt:
+            self._logs.append(f"{prefix} {txt}")
 
     def write(self, *args, **kwargs):
         if args:
@@ -250,13 +3184,8 @@ class LegacyStreamlitModule(types.ModuleType):
         self._log("CAPTION:", body)
         return self._real.caption(body, *args, **kwargs)
 
-    def text(self, body="", *args, **kwargs):
-        self._log("TEXT:", body)
-        return self._real.text(body, *args, **kwargs)
-
-    # ---------- widgets communs ----------
     def text_input(self, label, value="", *args, **kwargs):
-        lk = str(label).strip().lower()
+        lk = self._label(label)
         if "nom complet" in lk:
             return self._shared.get("nom_complet", value)
         if lk == "nom":
@@ -266,13 +3195,13 @@ class LegacyStreamlitModule(types.ModuleType):
         return self._real.text_input(label, value=value, *args, **kwargs)
 
     def number_input(self, label, *args, **kwargs):
-        lk = str(label).strip().lower()
+        lk = self._label(label)
         if "taille" in lk:
             return self._shared.get("taille_cm", kwargs.get("value", 170))
         return self._real.number_input(label, *args, **kwargs)
 
     def slider(self, label, *args, **kwargs):
-        lk = str(label).strip().lower()
+        lk = self._label(label)
         if "seuil confiance" in lk or lk == "confiance":
             return self._shared.get("conf", kwargs.get("value", 0.3))
         if "lissage norme" in lk:
@@ -284,13 +3213,13 @@ class LegacyStreamlitModule(types.ModuleType):
         return self._real.slider(label, *args, **kwargs)
 
     def checkbox(self, label, value=False, *args, **kwargs):
-        lk = str(label).strip().lower()
+        lk = self._label(label)
         if "afficher la norme" in lk:
             return self._shared.get("show_norm", value)
         return self._real.checkbox(label, value=value, *args, **kwargs)
 
     def selectbox(self, label, options, *args, **kwargs):
-        lk = str(label).strip().lower()
+        lk = self._label(label)
         if "angle de film" in lk:
             target = self._shared.get("camera_pos")
             if target in options:
@@ -302,7 +3231,7 @@ class LegacyStreamlitModule(types.ModuleType):
         return self._real.selectbox(label, options, *args, **kwargs)
 
     def button(self, label, *args, **kwargs):
-        lk = str(label).strip().lower()
+        lk = self._label(label)
         if "lancer l'analyse" in lk or "analyser" in lk or "lancer analyse" in lk:
             return bool(self._launch_analysis)
         return self._real.button(label, *args, **kwargs)
@@ -343,12 +3272,10 @@ def patched_streamlit(fake_streamlit):
             sys.modules["streamlit"] = old_streamlit
         else:
             sys.modules.pop("streamlit", None)
-
         if old_components is not None:
             sys.modules["streamlit.components"] = old_components
         else:
             sys.modules.pop("streamlit.components", None)
-
         if old_components_v1 is not None:
             sys.modules["streamlit.components.v1"] = old_components_v1
         else:
@@ -356,9 +3283,9 @@ def patched_streamlit(fake_streamlit):
 
 
 def run_legacy_module(code_text: str, shared_values: Dict[str, Any], module_title: str, uploaded_file):
-    fake_st = LegacyStreamlitModule(
+    fake_st = LegacyStreamlit(
         real_st=st,
-        shared_values=shared_values,
+        shared=shared_values,
         module_title=module_title,
         uploaded_file=uploaded_file,
         launch_analysis=True,
@@ -372,63 +3299,31 @@ def run_legacy_module(code_text: str, shared_values: Dict[str, Any], module_titl
     try:
         with patched_streamlit(fake_st):
             exec(code_text, namespace, namespace)
-        return {
-            "ok": True,
-            "error": None,
-            "downloads": fake_st._downloads,
-            "logs": fake_st._logs,
-        }
+        return {"ok": True, "error": None, "downloads": fake_st._downloads, "logs": fake_st._logs}
     except _StopLegacy:
-        return {
-            "ok": True,
-            "error": None,
-            "downloads": fake_st._downloads,
-            "logs": fake_st._logs,
-        }
+        return {"ok": True, "error": None, "downloads": fake_st._downloads, "logs": fake_st._logs}
     except Exception:
-        return {
-            "ok": False,
-            "error": traceback.format_exc(),
-            "downloads": fake_st._downloads,
-            "logs": fake_st._logs,
-        }
+        return {"ok": False, "error": traceback.format_exc(), "downloads": fake_st._downloads, "logs": fake_st._logs}
 
 
 # ============================================================
-# APP PRINCIPALE
+# APP COMMUNE
 # ============================================================
 st.set_page_config(page_title="Analyse biomécanique unifiée", layout="wide")
 st.title("Analyse biomécanique unifiée")
-st.caption("Une seule saisie des paramètres communs, avec conservation des calculs des 4 codes initiaux.")
-
-legacy_parts = split_legacy_apps(SOURCE_TEXT)
-
-if len(legacy_parts) < 4:
-    st.error(f"Impossible de détecter 4 scripts dans le fichier source. Détecté : {len(legacy_parts)}")
-    st.stop()
-
-legacy_modules = {
-    "Analyse frontale / vue arrière": legacy_parts[0],
-    "Analyse cinématique": legacy_parts[1],
-    "Analyse posturale frontale": legacy_parts[2],
-    "Analyse posturale latérale": legacy_parts[3],
-}
+st.caption("Une seule saisie des paramètres communs, avec les 4 codes d'origine conservés explicitement.")
 
 with st.sidebar:
     st.header("Paramètres communs")
-
     nom = st.text_input("Nom", "DURAND")
     prenom = st.text_input("Prénom", "Jean")
     nom_complet = st.text_input("Nom complet", f"{nom} {prenom}")
     taille_cm = st.number_input("Taille du patient (cm)", min_value=80, max_value=230, value=170, step=1)
-
     conf = st.slider("Seuil confiance", 0.1, 0.9, 0.3, 0.05)
     smooth = st.slider("Lissage", 0, 10, 3)
     show_norm = st.checkbox("Afficher la norme", value=True)
-
     camera_pos = st.selectbox("Angle de film", ["Devant", "Derrière", "Profil droit", "Profil gauche"])
     phase_cote = st.selectbox("Phases", ["Aucune", "Droite", "Gauche", "Les deux"])
-
     norm_smooth_win = st.slider("Lissage norme (simple)", 1, 21, 7, 2)
     num_photos = st.slider("Nombre d'images extraites", 1, 10, 3)
 
@@ -448,28 +3343,24 @@ shared_values = {
 
 st.subheader("Fichiers d'analyse")
 col1, col2 = st.columns(2)
-
 with col1:
     file_front = st.file_uploader("Vidéo - analyse frontale / vue arrière", type=["mp4", "avi", "mov"], key="front")
     file_cine = st.file_uploader("Vidéo - analyse cinématique", type=["mp4", "avi", "mov"], key="cine")
-
 with col2:
     file_post_front = st.file_uploader("Image - analyse posturale frontale", type=["png", "jpg", "jpeg"], key="post_front")
     file_post_lat = st.file_uploader("Image - analyse posturale latérale", type=["png", "jpg", "jpeg"], key="post_lat")
 
 plan = [
-    ("Analyse frontale / vue arrière", file_front),
-    ("Analyse cinématique", file_cine),
-    ("Analyse posturale frontale", file_post_front),
-    ("Analyse posturale latérale", file_post_lat),
+    ("Analyse frontale / vue arrière", FRONTALE_CODE, file_front),
+    ("Analyse cinématique", CINEMATIQUE_CODE, file_cine),
+    ("Analyse posturale frontale", POSTURE_FRONTALE_CODE, file_post_front),
+    ("Analyse posturale latérale", POSTURE_LATERALE_CODE, file_post_lat),
 ]
 
-run_all = st.button("▶ Lancer les analyses", type="primary")
+if st.button("▶ Lancer les analyses", type="primary"):
+    module_runs = []
 
-if run_all:
-    module_runs: List[Dict[str, Any]] = []
-
-    for module_title, uploaded in plan:
+    for module_title, module_code, uploaded in plan:
         st.markdown("---")
         st.subheader(module_title)
 
@@ -485,19 +3376,19 @@ if run_all:
             continue
 
         result = run_legacy_module(
-            code_text=legacy_modules[module_title],
+            code_text=module_code,
             shared_values=shared_values,
             module_title=module_title,
             uploaded_file=uploaded,
         )
 
+        status = "Analysé" if result["ok"] else "Erreur"
+
         if result["ok"]:
             st.success("Analyse terminée")
-            status = "Analysé"
         else:
             st.error("Erreur pendant l'exécution du module")
             st.code(result["error"])
-            status = "Erreur"
 
         if result["downloads"]:
             st.caption("Fichiers produits par le module :")
@@ -511,11 +3402,6 @@ if run_all:
                     mime=mime,
                     key=f"download_{module_title}_{i}",
                 )
-
-        if result["logs"]:
-            with st.expander(f"Journal d'affichage - {module_title}", expanded=False):
-                for line in result["logs"][:120]:
-                    st.write(line)
 
         module_runs.append({
             "title": module_title,
@@ -538,4 +3424,4 @@ if run_all:
         mime="application/pdf",
     )
 else:
-    st.info("Renseignez les paramètres communs, chargez les fichiers souhaités, puis lancez les analyses.")
+    st.info("Renseignez les paramètres communs, chargez les fichiers, puis lancez les analyses.")
