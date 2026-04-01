@@ -174,9 +174,7 @@ def detect_pose(frame):
 # ANGLES FRONTAUX
 # ==============================
 def angle_3pts(a, b, c):
-    """
-    Angle géométrique (0-180°) au point b entre les segments b->a et b->c.
-    """
+    # Angle géométrique (0-180°) au point b entre les segments b->a et b->c.
     ba = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
     bc = np.asarray(c, dtype=float) - np.asarray(b, dtype=float)
 
@@ -189,29 +187,25 @@ def angle_3pts(a, b, c):
     cosv = np.clip(cosv, -1.0, 1.0)
     return float(np.degrees(np.arccos(cosv)))
 
+
 def signed_angle_vs_vertical(p1, p2):
-    """
-    Angle signé du segment p1->p2 par rapport à la verticale.
-    """
+    # Angle signé du segment p1->p2 par rapport à la verticale.
     v = np.asarray(p2, dtype=float) - np.asarray(p1, dtype=float)
     vx = v[0]
     vy = -(v[1])
     return float(np.degrees(np.arctan2(vx, vy + 1e-9)))
 
+
 def signed_angle_vs_horizontal(p1, p2):
-    """
-    Angle signé du segment p1->p2 par rapport à l'horizontale.
-    """
+    # Angle signé du segment p1->p2 par rapport à l'horizontale.
     v = np.asarray(p2, dtype=float) - np.asarray(p1, dtype=float)
     vx = v[0]
     vy = -(v[1])
     return float(np.degrees(np.arctan2(vy, vx + 1e-9)))
 
+
 def angle_genou_frontal(hip, knee, ankle, side=None):
-    """
-    Déviation frontale du genou = angle cuisse/jambe.
-    0° ~ alignement neutre.
-    """
+    # Déviation frontale du genou = angle cuisse/jambe. 0° ~ alignement neutre.
     raw = angle_3pts(hip, knee, ankle)   # proche de 180 si aligné
     dev = 180.0 - raw                    # proche de 0 si aligné
 
